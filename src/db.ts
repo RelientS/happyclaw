@@ -26,6 +26,13 @@ import {
   UserSessionWithUser,
   Permission,
   PermissionTemplateKey,
+  Workspace,
+  WorkspaceMember,
+  WorkspaceTask,
+  WorkspaceInvite,
+  WorkspaceRole,
+  TaskType,
+  WorkspaceTaskStatus,
 } from './types.js';
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
@@ -508,7 +515,74 @@ export function initDatabase(): void {
     })();
   }
 
-  const SCHEMA_VERSION = '17';
+  // v17→v18 migration: add Shared Workspace tables
+  if (curVer && parseInt(curVer, 10) < 18) {
+    db.transaction(() => {
+      // Create workspaces table
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS workspaces (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          folder TEXT UNIQUE NOT NULL,
+          name TEXT NOT NULL,
+          owner_user_id TEXT NOT NULL,
+          execution_mode TEXT DEFAULT 'container',
+          max_parallel_tasks INTEGER DEFAULT 3,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (owner_user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS workspace_members (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id INTEGER NOT NULL,
+          user_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          joined_at TEXT NOT NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+          FOREIGN KEY (user_id) REFERENCES users(id),
+          UNIQUE(workspace_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id);
+
+        CREATE TABLE IF NOT EXISTS workspace_tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id INTEGER NOT NULL,
+          requested_by_user_id TEXT NOT NULL,
+          message TEXT NOT NULL,
+          task_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          priority INTEGER DEFAULT 0,
+          queue_position INTEGER,
+          started_at TEXT,
+          completed_at TEXT,
+          result TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+          FOREIGN KEY (requested_by_user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_tasks_status ON workspace_tasks(workspace_id, status);
+        CREATE INDEX IF NOT EXISTS idx_workspace_tasks_queue ON workspace_tasks(workspace_id, status, priority DESC, id ASC);
+
+        CREATE TABLE IF NOT EXISTS workspace_invites (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id INTEGER NOT NULL,
+          code TEXT UNIQUE NOT NULL,
+          created_by_user_id TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          used_at TEXT,
+          used_by_user_id TEXT,
+          FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
+          FOREIGN KEY (created_by_user_id) REFERENCES users(id),
+          FOREIGN KEY (used_by_user_id) REFERENCES users(id)
+        );
+      `);
+    })();
+  }
+
+  // Add columns for workspace binding to registered_groups
+  ensureColumn('registered_groups', 'workspace_id', 'INTEGER');
+  ensureColumn('registered_groups', 'is_shared_workspace', 'INTEGER DEFAULT 0');
+
+  const SCHEMA_VERSION = '18';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -2390,6 +2464,300 @@ export function isGroupShared(groupFolder: string): boolean {
     )
     .get(groupFolder) as { cnt: number };
   return row.cnt > 1;
+}
+
+// ===================== Shared Workspace CRUD =====================
+
+export function createWorkspace(workspace: Omit<Workspace, 'id'>): number {
+  const result = db.prepare(
+    `INSERT INTO workspaces (folder, name, owner_user_id, execution_mode, max_parallel_tasks, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    workspace.folder,
+    workspace.name,
+    workspace.owner_user_id,
+    workspace.execution_mode,
+    workspace.max_parallel_tasks,
+    workspace.created_at,
+  );
+  return Number(result.lastInsertRowid);
+}
+
+export function getWorkspace(id: number): Workspace | undefined {
+  const row = db.prepare('SELECT * FROM workspaces WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    id: Number(row.id),
+    folder: String(row.folder),
+    name: String(row.name),
+    owner_user_id: String(row.owner_user_id),
+    execution_mode: String(row.execution_mode) as 'container' | 'host',
+    max_parallel_tasks: Number(row.max_parallel_tasks),
+    created_at: String(row.created_at),
+  };
+}
+
+export function getWorkspaceByFolder(folder: string): Workspace | undefined {
+  const row = db.prepare('SELECT * FROM workspaces WHERE folder = ?').get(folder) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    id: Number(row.id),
+    folder: String(row.folder),
+    name: String(row.name),
+    owner_user_id: String(row.owner_user_id),
+    execution_mode: String(row.execution_mode) as 'container' | 'host',
+    max_parallel_tasks: Number(row.max_parallel_tasks),
+    created_at: String(row.created_at),
+  };
+}
+
+export function listWorkspaces(userId?: string): Workspace[] {
+  const sql = userId
+    ? `SELECT w.* FROM workspaces w
+       INNER JOIN workspace_members wm ON w.id = wm.workspace_id
+       WHERE wm.user_id = ?
+       ORDER BY w.created_at DESC`
+    : 'SELECT * FROM workspaces ORDER BY created_at DESC';
+  const rows = userId
+    ? db.prepare(sql).all(userId) as Array<Record<string, unknown>>
+    : db.prepare(sql).all() as Array<Record<string, unknown>>;
+  return rows.map(row => ({
+    id: Number(row.id),
+    folder: String(row.folder),
+    name: String(row.name),
+    owner_user_id: String(row.owner_user_id),
+    execution_mode: String(row.execution_mode) as 'container' | 'host',
+    max_parallel_tasks: Number(row.max_parallel_tasks),
+    created_at: String(row.created_at),
+  }));
+}
+
+export function updateWorkspace(id: number, updates: Partial<Pick<Workspace, 'name' | 'max_parallel_tasks'>>): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  if (updates.name !== undefined) {
+    fields.push('name = ?');
+    values.push(updates.name);
+  }
+  if (updates.max_parallel_tasks !== undefined) {
+    fields.push('max_parallel_tasks = ?');
+    values.push(updates.max_parallel_tasks);
+  }
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE workspaces SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+}
+
+export function deleteWorkspace(id: number): void {
+  db.transaction(() => {
+    db.prepare('DELETE FROM workspace_tasks WHERE workspace_id = ?').run(id);
+    db.prepare('DELETE FROM workspace_invites WHERE workspace_id = ?').run(id);
+    db.prepare('DELETE FROM workspace_members WHERE workspace_id = ?').run(id);
+    db.prepare('DELETE FROM workspaces WHERE id = ?').run(id);
+  })();
+}
+
+// Workspace Members
+
+export function addWorkspaceMember(
+  workspaceId: number,
+  userId: string,
+  role: WorkspaceRole,
+): void {
+  db.prepare(
+    `INSERT INTO workspace_members (workspace_id, user_id, role, joined_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role`
+  ).run(workspaceId, userId, role, new Date().toISOString());
+}
+
+export function removeWorkspaceMember(workspaceId: number, userId: string): void {
+  db.prepare('DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?').run(workspaceId, userId);
+}
+
+export function getWorkspaceMembers(workspaceId: number): WorkspaceMember[] {
+  const rows = db.prepare(
+    `SELECT wm.*, u.username, COALESCE(u.display_name, '') as display_name
+     FROM workspace_members wm
+     JOIN users u ON wm.user_id = u.id
+     WHERE wm.workspace_id = ?
+     ORDER BY wm.role DESC, wm.joined_at ASC`
+  ).all(workspaceId) as Array<Record<string, unknown>>;
+  return rows.map(row => ({
+    id: Number(row.id),
+    workspace_id: Number(row.workspace_id),
+    user_id: String(row.user_id),
+    role: String(row.role) as WorkspaceRole,
+    joined_at: String(row.joined_at),
+    username: String(row.username),
+    display_name: String(row.display_name),
+  }));
+}
+
+export function getWorkspaceMemberRole(workspaceId: number, userId: string): WorkspaceRole | null {
+  const row = db.prepare(
+    'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?'
+  ).get(workspaceId, userId) as { role: string } | undefined;
+  return row ? (row.role as WorkspaceRole) : null;
+}
+
+// Workspace Tasks
+
+export function createWorkspaceTask(task: Omit<WorkspaceTask, 'id' | 'created_at'>): number {
+  const result = db.prepare(
+    `INSERT INTO workspace_tasks (workspace_id, requested_by_user_id, message, task_type, status, priority, queue_position, started_at, completed_at, result, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    task.workspace_id,
+    task.requested_by_user_id,
+    task.message,
+    task.task_type,
+    task.status,
+    task.priority,
+    task.queue_position ?? null,
+    task.started_at ?? null,
+    task.completed_at ?? null,
+    task.result ?? null,
+    new Date().toISOString(),
+  );
+  return Number(result.lastInsertRowid);
+}
+
+export function getWorkspaceTask(id: number): WorkspaceTask | undefined {
+  const row = db.prepare(
+    `SELECT wt.*, u.username as requested_by_username
+     FROM workspace_tasks wt
+     JOIN users u ON wt.requested_by_user_id = u.id
+     WHERE wt.id = ?`
+  ).get(id) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return mapWorkspaceTaskRow(row);
+}
+
+export function listWorkspaceTasks(workspaceId: number, status?: WorkspaceTaskStatus): WorkspaceTask[] {
+  const sql = status
+    ? `SELECT wt.*, u.username as requested_by_username
+       FROM workspace_tasks wt
+       JOIN users u ON wt.requested_by_user_id = u.id
+       WHERE wt.workspace_id = ? AND wt.status = ?
+       ORDER BY wt.priority DESC, wt.id ASC`
+    : `SELECT wt.*, u.username as requested_by_username
+       FROM workspace_tasks wt
+       JOIN users u ON wt.requested_by_user_id = u.id
+       WHERE wt.workspace_id = ?
+       ORDER BY wt.created_at DESC`;
+  const rows = status
+    ? db.prepare(sql).all(workspaceId, status) as Array<Record<string, unknown>>
+    : db.prepare(sql).all(workspaceId) as Array<Record<string, unknown>>;
+  return rows.map(mapWorkspaceTaskRow);
+}
+
+export function updateWorkspaceTask(
+  id: number,
+  updates: Partial<Pick<WorkspaceTask, 'status' | 'queue_position' | 'started_at' | 'completed_at' | 'result'>>
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.queue_position !== undefined) {
+    fields.push('queue_position = ?');
+    values.push(updates.queue_position);
+  }
+  if (updates.started_at !== undefined) {
+    fields.push('started_at = ?');
+    values.push(updates.started_at);
+  }
+  if (updates.completed_at !== undefined) {
+    fields.push('completed_at = ?');
+    values.push(updates.completed_at);
+  }
+  if (updates.result !== undefined) {
+    fields.push('result = ?');
+    values.push(updates.result);
+  }
+  if (fields.length === 0) return;
+  values.push(id);
+  db.prepare(`UPDATE workspace_tasks SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+}
+
+function mapWorkspaceTaskRow(row: Record<string, unknown>): WorkspaceTask {
+  return {
+    id: Number(row.id),
+    workspace_id: Number(row.workspace_id),
+    requested_by_user_id: String(row.requested_by_user_id),
+    message: String(row.message),
+    task_type: String(row.task_type) as TaskType,
+    status: String(row.status) as WorkspaceTaskStatus,
+    priority: Number(row.priority),
+    queue_position: typeof row.queue_position === 'number' ? row.queue_position : null,
+    started_at: typeof row.started_at === 'string' ? row.started_at : null,
+    completed_at: typeof row.completed_at === 'string' ? row.completed_at : null,
+    result: typeof row.result === 'string' ? row.result : null,
+    requested_by_username: typeof row.requested_by_username === 'string' ? row.requested_by_username : undefined,
+  };
+}
+
+// Workspace Invites
+
+export function createWorkspaceInvite(invite: Omit<WorkspaceInvite, 'id' | 'used_at' | 'used_by_user_id'>): string {
+  db.prepare(
+    `INSERT INTO workspace_invites (workspace_id, code, created_by_user_id, expires_at)
+     VALUES (?, ?, ?, ?)`
+  ).run(invite.workspace_id, invite.code, invite.created_by_user_id, invite.expires_at);
+  return invite.code;
+}
+
+export function getWorkspaceInvite(code: string): WorkspaceInvite | undefined {
+  const row = db.prepare(
+    `SELECT wi.*, u1.username as creator_username, u2.username as used_by_username
+     FROM workspace_invites wi
+     LEFT JOIN users u1 ON wi.created_by_user_id = u1.id
+     LEFT JOIN users u2 ON wi.used_by_user_id = u2.id
+     WHERE wi.code = ?`
+  ).get(code) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    id: Number(row.id),
+    workspace_id: Number(row.workspace_id),
+    code: String(row.code),
+    created_by_user_id: String(row.created_by_user_id),
+    expires_at: String(row.expires_at),
+    used_at: typeof row.used_at === 'string' ? row.used_at : null,
+    used_by_user_id: typeof row.used_by_user_id === 'string' ? row.used_by_user_id : null,
+    creator_username: typeof row.creator_username === 'string' ? row.creator_username : undefined,
+    used_by_username: typeof row.used_by_username === 'string' ? row.used_by_username : undefined,
+  };
+}
+
+export function markInviteAsUsed(code: string, userId: string): void {
+  db.prepare(
+    'UPDATE workspace_invites SET used_at = ?, used_by_user_id = ? WHERE code = ?'
+  ).run(new Date().toISOString(), userId, code);
+}
+
+export function listWorkspaceInvites(workspaceId: number): WorkspaceInvite[] {
+  const rows = db.prepare(
+    `SELECT wi.*, u1.username as creator_username, u2.username as used_by_username
+     FROM workspace_invites wi
+     LEFT JOIN users u1 ON wi.created_by_user_id = u1.id
+     LEFT JOIN users u2 ON wi.used_by_user_id = u2.id
+     WHERE wi.workspace_id = ?
+     ORDER BY wi.expires_at DESC`
+  ).all(workspaceId) as Array<Record<string, unknown>>;
+  return rows.map(row => ({
+    id: Number(row.id),
+    workspace_id: Number(row.workspace_id),
+    code: String(row.code),
+    created_by_user_id: String(row.created_by_user_id),
+    expires_at: String(row.expires_at),
+    used_at: typeof row.used_at === 'string' ? row.used_at : null,
+    used_by_user_id: typeof row.used_by_user_id === 'string' ? row.used_by_user_id : null,
+    creator_username: typeof row.creator_username === 'string' ? row.creator_username : undefined,
+    used_by_username: typeof row.used_by_username === 'string' ? row.used_by_username : undefined,
+  }));
 }
 
 /**
