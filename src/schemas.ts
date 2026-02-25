@@ -302,6 +302,35 @@ export const TerminalStopSchema = z.object({
   chatJid: z.string().min(1),
 });
 
+// Workspace schemas
+export const WorkspaceCreateSchema = z.object({
+  name: z.string().min(1).max(100),
+  execution_mode: z.enum(['container', 'host']).optional(),
+  max_parallel_tasks: z.number().int().min(1).max(10).optional(),
+});
+
+export const WorkspaceUpdateSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  max_parallel_tasks: z.number().int().min(1).max(10).optional(),
+});
+
+export const WorkspaceMemberAddSchema = z.object({
+  user_id: z.string().min(1),
+  role: z.enum(['owner', 'admin', 'member', 'viewer']).optional(),
+});
+
+export const WorkspaceJoinSchema = z.object({
+  invite_code: z.string().min(1),
+});
+
+export const WorkspaceBindGroupSchema = z.object({
+  group_jid: z.string().min(1),
+});
+
+export const WorkspaceInviteCreateSchema = z.object({
+  expires_in_hours: z.number().int().min(1).max(8760).optional(), // 默认 24 小时，最长 1 年
+});
+
 // Memory types
 export interface MemorySource {
   path: string;

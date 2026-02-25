@@ -46,6 +46,7 @@ import monitorRoutes from './routes/monitor.js';
 import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
+import workspaceRoutes from './routes/workspaces.js';
 
 // Database and types (only for handleWebUserMessage and broadcast)
 import {
@@ -59,11 +60,13 @@ import {
   getGroupMembers,
   getAgent,
   isGroupShared,
+  getWorkspaceMembers,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
 import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
 import { logger } from './logger.js';
+import { workspaceManager } from './workspace-queue.js';
 
 // --- App Setup ---
 
@@ -136,6 +139,7 @@ app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
+app.route('/api/workspaces', workspaceRoutes); // Shared workspace routes
 app.route('/api', monitorRoutes);
 
 // --- POST /api/messages ---
@@ -934,6 +938,18 @@ export function broadcastAgentStatus(
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 }
 
+/**
+ * Broadcast workspace events to all workspace members.
+ * Filters broadcasts to only users who are members of the workspace.
+ */
+export function broadcastToWorkspace(workspaceId: number, event: WsMessageOut): void {
+  const members = getWorkspaceMembers(workspaceId);
+  const allowedUserIds = new Set(members.map((m) => m.user_id));
+
+  // Workspace events are never host-only (always container mode)
+  safeBroadcast(event, false, allowedUserIds);
+}
+
 function broadcastStatus(): void {
   if (!deps) return;
 
@@ -986,6 +1002,47 @@ export function startWebServer(webDeps: WebDeps): void {
         }
       }
     }
+  });
+
+  // Register workspace event listeners
+  workspaceManager.on('workspace.task.created', ({ workspaceId, task }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.created' as any,
+      workspaceId,
+      task,
+    });
+  });
+
+  workspaceManager.on('workspace.task.started', ({ workspaceId, task }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.started' as any,
+      workspaceId,
+      task,
+    });
+  });
+
+  workspaceManager.on('workspace.task.progress', ({ workspaceId, event }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.progress' as any,
+      workspaceId,
+      event,
+    });
+  });
+
+  workspaceManager.on('workspace.task.completed', ({ workspaceId, task }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.completed' as any,
+      workspaceId,
+      task,
+    });
+  });
+
+  workspaceManager.on('workspace.queue.updated', ({ workspaceId, queue }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.queue.updated' as any,
+      workspaceId,
+      queue,
+    });
   });
 
   // Broadcast status every 5 seconds

@@ -352,7 +352,7 @@ export type WsMessageOut =
   // Workspace events
   | { type: 'workspace.task.created'; workspaceId: number; task: WorkspaceTask }
   | { type: 'workspace.task.started'; workspaceId: number; task: WorkspaceTask }
-  | { type: 'workspace.task.progress'; workspaceId: number; taskId: number; event: StreamEvent }
+  | { type: 'workspace.task.progress'; workspaceId: number; event: any } // TODO: refine event type when container integration is done
   | { type: 'workspace.task.completed'; workspaceId: number; task: WorkspaceTask }
   | { type: 'workspace.queue.updated'; workspaceId: number; queue: WorkspaceTask[] };
 

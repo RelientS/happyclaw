@@ -93,7 +93,9 @@ import {
   deleteAgent as deleteAgentDb,
   getSession,
   listAgentsByJid,
+  getWorkspaceMemberRole,
 } from './db.js';
+import { workspaceManager } from './workspace-queue.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
 import {
@@ -456,6 +458,73 @@ function collectMessageImages(
     }
   }
   return images;
+}
+
+/**
+ * Process messages for workspace-bound groups.
+ * Routes messages to workspace task queue instead of direct execution.
+ */
+async function processWorkspaceMessage(
+  chatJid: string,
+  workspaceId: number,
+  messages: NewMessage[]
+): Promise<void> {
+  if (messages.length === 0) return;
+
+  // Get the last message to determine the sender
+  const lastMsg = messages[messages.length - 1];
+  const senderId = lastMsg.sender;
+
+  // Skip system/agent messages
+  if (senderId === 'happyclaw-agent' || senderId === '__system__') {
+    return;
+  }
+
+  // Check workspace membership and permissions
+  const memberRole = getWorkspaceMemberRole(workspaceId, senderId);
+  if (!memberRole || memberRole === 'viewer') {
+    // Viewer or non-member: no permission to create tasks
+    const senderUser = getUserById(senderId);
+    const username = senderUser?.username || senderId;
+
+    await sendMessage(chatJid, `@${username} 你没有在此工作区发起任务的权限`);
+    logger.warn(
+      { chatJid, workspaceId, senderId, memberRole },
+      'User has no permission to create workspace tasks'
+    );
+    return;
+  }
+
+  // Format all messages into a single task prompt
+  const messageContent = messages.map(m => `[${m.sender_name}] ${m.content}`).join('\n\n');
+
+  try {
+    // Add task to workspace queue
+    const task = await workspaceManager.addTask(workspaceId, senderId, messageContent);
+
+    // Send confirmation to IM channel
+    const senderUser = getUserById(senderId);
+    const username = senderUser?.username || senderId;
+    const queueStatus = workspaceManager.getQueueStatus(workspaceId);
+    const queueLength = queueStatus?.queued.length || 0;
+
+    let statusMsg = `@${username} 收到，任务已加入队列 [#${task.id}]`;
+    if (task.task_type === 'quick') {
+      statusMsg += `\n类型: 快速任务（将立即执行）`;
+    } else if (queueLength > 0) {
+      statusMsg += `\n当前队列: ${queueLength} 个任务等待中`;
+    }
+
+    await sendMessage(chatJid, statusMsg);
+
+    logger.info(
+      { chatJid, workspaceId, taskId: task.id, taskType: task.task_type },
+      'Workspace task created'
+    );
+  } catch (err) {
+    logger.error({ err, chatJid, workspaceId }, 'Failed to create workspace task');
+    await sendMessage(chatJid, '❌ 创建任务失败，请稍后重试');
+  }
 }
 
 /**
@@ -2195,6 +2264,34 @@ async function startMessageLoop(): Promise<void> {
             }
           }
           if (!group) continue;
+
+          // Check if this is a workspace-bound group
+          if (group.is_shared_workspace && group.workspace_id) {
+            // Pull all messages since lastAgentTimestamp to preserve full context
+            const allPending = getMessagesSince(
+              chatJid,
+              lastAgentTimestamp[chatJid] || EMPTY_CURSOR,
+            );
+            const messagesToSend =
+              allPending.length > 0 ? allPending : groupMessages;
+
+            // Route to workspace task queue
+            await processWorkspaceMessage(chatJid, group.workspace_id, messagesToSend);
+
+            // Update cursor to mark messages as processed
+            const lastProcessed = messagesToSend[messagesToSend.length - 1];
+            if (lastProcessed) {
+              lastAgentTimestamp[chatJid] = {
+                id: lastProcessed.id,
+                timestamp: lastProcessed.timestamp,
+              };
+              saveState();
+            }
+
+            // Skip normal container processing
+            continue;
+          }
+
           if (group.is_home) homeFolders.add(group.folder);
 
           // Handle cold-cache/newly-added groups: detect home folders from DB
