@@ -329,6 +329,7 @@ export const WorkspaceBindGroupSchema = z.object({
 
 export const WorkspaceInviteCreateSchema = z.object({
   expires_in_hours: z.number().int().min(1).max(8760).optional(), // 默认 24 小时，最长 1 年
+  max_uses: z.number().int().min(0).max(1000).optional(), // 0 = 无限次，默认 0
 });
 
 // Memory types

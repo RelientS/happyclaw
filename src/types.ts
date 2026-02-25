@@ -108,6 +108,8 @@ export interface WorkspaceInvite {
   code: string;
   created_by_user_id: string;
   expires_at: string;
+  max_uses: number;
+  use_count: number;
   used_at: string | null;
   used_by_user_id: string | null;
   // 扩展字段

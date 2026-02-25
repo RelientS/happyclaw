@@ -158,8 +158,8 @@ export function initDatabase(): void {
     CREATE TABLE IF NOT EXISTS sessions (
       group_folder TEXT NOT NULL,
       session_id TEXT NOT NULL,
-      agent_id TEXT,
-      PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
+      agent_id TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY (group_folder, agent_id)
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -292,7 +292,7 @@ export function initDatabase(): void {
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
-  ensureColumn('sessions', 'agent_id', 'TEXT');
+  ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
 
   // Migration: remove UNIQUE constraint from registered_groups.folder
@@ -503,11 +503,11 @@ export function initDatabase(): void {
           CREATE TABLE sessions_new (
             group_folder TEXT NOT NULL,
             session_id TEXT NOT NULL,
-            agent_id TEXT,
-            PRIMARY KEY (group_folder, COALESCE(agent_id, ''))
+            agent_id TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (group_folder, agent_id)
           );
           INSERT OR IGNORE INTO sessions_new (group_folder, session_id, agent_id)
-            SELECT group_folder, session_id, agent_id FROM sessions;
+            SELECT group_folder, session_id, COALESCE(agent_id, '') FROM sessions;
           DROP TABLE sessions;
           ALTER TABLE sessions_new RENAME TO sessions;
         `);
@@ -516,7 +516,8 @@ export function initDatabase(): void {
   }
 
   // v17→v18 migration: add Shared Workspace tables
-  if (curVer && parseInt(curVer, 10) < 18) {
+  // Run for both fresh installs (curVer undefined) and upgrades from <18
+  if (!curVer || parseInt(curVer, 10) < 18) {
     db.transaction(() => {
       // Create workspaces table
       db.exec(`
@@ -568,6 +569,8 @@ export function initDatabase(): void {
           code TEXT UNIQUE NOT NULL,
           created_by_user_id TEXT NOT NULL,
           expires_at TEXT NOT NULL,
+          max_uses INTEGER DEFAULT 0,
+          use_count INTEGER DEFAULT 0,
           used_at TEXT,
           used_by_user_id TEXT,
           FOREIGN KEY (workspace_id) REFERENCES workspaces(id),
@@ -581,6 +584,10 @@ export function initDatabase(): void {
   // Add columns for workspace binding to registered_groups
   ensureColumn('registered_groups', 'workspace_id', 'INTEGER');
   ensureColumn('registered_groups', 'is_shared_workspace', 'INTEGER DEFAULT 0');
+
+  // Add multi-use support to workspace_invites
+  ensureColumn('workspace_invites', 'max_uses', 'INTEGER DEFAULT 0');
+  ensureColumn('workspace_invites', 'use_count', 'INTEGER DEFAULT 0');
 
   const SCHEMA_VERSION = '18';
   db.prepare(
@@ -930,38 +937,24 @@ export function setRouterState(key: string, value: string): void {
 // --- Session accessors ---
 
 export function getSession(groupFolder: string, agentId?: string | null): string | undefined {
-  if (agentId) {
-    const row = db
-      .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id = ?')
-      .get(groupFolder, agentId) as { session_id: string } | undefined;
-    return row?.session_id;
-  }
+  const aid = agentId || '';
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id IS NULL')
-    .get(groupFolder) as { session_id: string } | undefined;
+    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND agent_id = ?')
+    .get(groupFolder, aid) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
 export function setSession(groupFolder: string, sessionId: string, agentId?: string | null): void {
-  if (agentId) {
-    db.prepare(
-      `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
-       ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
-    ).run(groupFolder, sessionId, agentId);
-    return;
-  }
+  const aid = agentId || '';
   db.prepare(
-    `INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)
-     ON CONFLICT(group_folder, COALESCE(agent_id, '')) DO UPDATE SET session_id = excluded.session_id`,
-  ).run(groupFolder, sessionId);
+    `INSERT INTO sessions (group_folder, session_id, agent_id) VALUES (?, ?, ?)
+     ON CONFLICT(group_folder, agent_id) DO UPDATE SET session_id = excluded.session_id`,
+  ).run(groupFolder, sessionId, aid);
 }
 
 export function deleteSession(groupFolder: string, agentId?: string | null): void {
-  if (agentId) {
-    db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, agentId);
-    return;
-  }
-  db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id IS NULL').run(groupFolder);
+  const aid = agentId || '';
+  db.prepare('DELETE FROM sessions WHERE group_folder = ? AND agent_id = ?').run(groupFolder, aid);
 }
 
 export function deleteAllSessionsForFolder(groupFolder: string): void {
@@ -970,7 +963,7 @@ export function deleteAllSessionsForFolder(groupFolder: string): void {
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions WHERE agent_id IS NULL')
+    .prepare("SELECT group_folder, session_id FROM sessions WHERE agent_id = ''")
     .all() as Array<{ group_folder: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
@@ -2704,10 +2697,26 @@ function mapWorkspaceTaskRow(row: Record<string, unknown>): WorkspaceTask {
 
 export function createWorkspaceInvite(invite: Omit<WorkspaceInvite, 'id' | 'used_at' | 'used_by_user_id'>): string {
   db.prepare(
-    `INSERT INTO workspace_invites (workspace_id, code, created_by_user_id, expires_at)
-     VALUES (?, ?, ?, ?)`
-  ).run(invite.workspace_id, invite.code, invite.created_by_user_id, invite.expires_at);
+    `INSERT INTO workspace_invites (workspace_id, code, created_by_user_id, expires_at, max_uses, use_count)
+     VALUES (?, ?, ?, ?, ?, 0)`
+  ).run(invite.workspace_id, invite.code, invite.created_by_user_id, invite.expires_at, invite.max_uses ?? 0);
   return invite.code;
+}
+
+function rowToInvite(row: Record<string, unknown>): WorkspaceInvite {
+  return {
+    id: Number(row.id),
+    workspace_id: Number(row.workspace_id),
+    code: String(row.code),
+    created_by_user_id: String(row.created_by_user_id),
+    expires_at: String(row.expires_at),
+    max_uses: Number(row.max_uses ?? 0),
+    use_count: Number(row.use_count ?? 0),
+    used_at: typeof row.used_at === 'string' ? row.used_at : null,
+    used_by_user_id: typeof row.used_by_user_id === 'string' ? row.used_by_user_id : null,
+    creator_username: typeof row.creator_username === 'string' ? row.creator_username : undefined,
+    used_by_username: typeof row.used_by_username === 'string' ? row.used_by_username : undefined,
+  };
 }
 
 export function getWorkspaceInvite(code: string): WorkspaceInvite | undefined {
@@ -2719,22 +2728,17 @@ export function getWorkspaceInvite(code: string): WorkspaceInvite | undefined {
      WHERE wi.code = ?`
   ).get(code) as Record<string, unknown> | undefined;
   if (!row) return undefined;
-  return {
-    id: Number(row.id),
-    workspace_id: Number(row.workspace_id),
-    code: String(row.code),
-    created_by_user_id: String(row.created_by_user_id),
-    expires_at: String(row.expires_at),
-    used_at: typeof row.used_at === 'string' ? row.used_at : null,
-    used_by_user_id: typeof row.used_by_user_id === 'string' ? row.used_by_user_id : null,
-    creator_username: typeof row.creator_username === 'string' ? row.creator_username : undefined,
-    used_by_username: typeof row.used_by_username === 'string' ? row.used_by_username : undefined,
-  };
+  return rowToInvite(row);
 }
 
 export function markInviteAsUsed(code: string, userId: string): void {
+  // Increment use_count and set used_at/used_by_user_id on first use
   db.prepare(
-    'UPDATE workspace_invites SET used_at = ?, used_by_user_id = ? WHERE code = ?'
+    `UPDATE workspace_invites
+     SET use_count = use_count + 1,
+         used_at = COALESCE(used_at, ?),
+         used_by_user_id = COALESCE(used_by_user_id, ?)
+     WHERE code = ?`
   ).run(new Date().toISOString(), userId, code);
 }
 
@@ -2747,17 +2751,7 @@ export function listWorkspaceInvites(workspaceId: number): WorkspaceInvite[] {
      WHERE wi.workspace_id = ?
      ORDER BY wi.expires_at DESC`
   ).all(workspaceId) as Array<Record<string, unknown>>;
-  return rows.map(row => ({
-    id: Number(row.id),
-    workspace_id: Number(row.workspace_id),
-    code: String(row.code),
-    created_by_user_id: String(row.created_by_user_id),
-    expires_at: String(row.expires_at),
-    used_at: typeof row.used_at === 'string' ? row.used_at : null,
-    used_by_user_id: typeof row.used_by_user_id === 'string' ? row.used_by_user_id : null,
-    creator_username: typeof row.creator_username === 'string' ? row.creator_username : undefined,
-    used_by_username: typeof row.used_by_username === 'string' ? row.used_by_username : undefined,
-  }));
+  return rows.map(rowToInvite);
 }
 
 /**

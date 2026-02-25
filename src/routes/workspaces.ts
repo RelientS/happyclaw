@@ -143,7 +143,7 @@ workspaceRoutes.post('/', authMiddleware, async (c) => {
   // 添加创建者为 owner
   addWorkspaceMember(workspaceId, user.id, 'owner');
 
-  // 生成初始邀请码（24 小时有效）
+  // 生成初始邀请码（24 小时有效，无限使用次数）
   const inviteCode = generateInviteCode();
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
   createWorkspaceInvite({
@@ -151,6 +151,8 @@ workspaceRoutes.post('/', authMiddleware, async (c) => {
     code: inviteCode,
     created_by_user_id: user.id,
     expires_at: expiresAt,
+    max_uses: 0,
+    use_count: 0,
   });
 
   logger.info(
@@ -383,7 +385,7 @@ workspaceRoutes.post('/:id/invites', authMiddleware, async (c) => {
     return c.json({ error: 'Invalid request body', details: validation.error }, 400);
   }
 
-  const { expires_in_hours = 24 } = validation.data;
+  const { expires_in_hours = 24, max_uses = 0 } = validation.data;
 
   const code = generateInviteCode();
   const expiresAt = new Date(Date.now() + expires_in_hours * 60 * 60 * 1000).toISOString();
@@ -393,6 +395,8 @@ workspaceRoutes.post('/:id/invites', authMiddleware, async (c) => {
     code,
     created_by_user_id: user.id,
     expires_at: expiresAt,
+    max_uses,
+    use_count: 0,
   });
 
   logger.info({ workspaceId, code, expiresInHours: expires_in_hours }, 'Workspace invite created');
@@ -441,9 +445,9 @@ workspaceRoutes.post('/join', authMiddleware, async (c) => {
     return c.json({ error: 'Invalid or expired invite code' }, 404);
   }
 
-  // 检查是否已使用
-  if (invite.used_at) {
-    return c.json({ error: 'Invite code already used' }, 400);
+  // 检查是否已用完（max_uses > 0 表示有使用次数限制）
+  if (invite.max_uses > 0 && invite.use_count >= invite.max_uses) {
+    return c.json({ error: 'Invite code has reached its maximum usage limit' }, 400);
   }
 
   // 检查是否过期
