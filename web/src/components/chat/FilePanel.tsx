@@ -360,7 +360,14 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
 
   const handleDownload = (item: FileEntry) => {
     const encoded = toBase64Url(item.path);
-    window.open(withBasePath(`/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`), '_blank');
+    const url = withBasePath(`/api/groups/${encodeURIComponent(groupJid)}/files/download/${encoded}`);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = item.name;
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   const handleDeleteClick = (item: FileEntry) => {

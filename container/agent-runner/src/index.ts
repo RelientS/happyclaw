@@ -38,6 +38,8 @@ interface ContainerInput {
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
   images?: Array<{ data: string; mimeType?: string }>;
+  agentId?: string;
+  agentName?: string;
 }
 
 /**
@@ -403,6 +405,19 @@ function shouldClose(): boolean {
   return false;
 }
 
+const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
+
+/**
+ * Check for _interrupt sentinel (graceful query interruption).
+ */
+function shouldInterrupt(): boolean {
+  if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
+    try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+    return true;
+  }
+  return false;
+}
+
 /**
  * Drain all pending IPC input messages.
  * Returns messages found (with optional images), or empty array.
@@ -424,6 +439,22 @@ function drainIpcInput(): Array<{ text: string; images?: Array<{ data: string; m
             text: data.text,
             images: data.images,
           });
+        } else if (data.type === 'agent_result') {
+          // Sub-agent completed — format result as a message injection
+          const statusLabel = data.status === 'completed' ? '已完成任务' : '执行出错';
+          const promptSnippet = data.prompt ? data.prompt.slice(0, 200) : '';
+          const lines = [
+            `[子 Agent "${data.agentName || data.agentId}" ${statusLabel}]`,
+            '',
+            promptSnippet ? `任务: ${promptSnippet}` : '',
+            '',
+            '结果:',
+            data.result || '(无结果)',
+          ].filter(Boolean);
+          messages.push({ text: lines.join('\n') });
+        } else if (data.type === 'agent_message' && data.message) {
+          // Message from main agent to sub-agent (via message_agent)
+          messages.push({ text: `[来自主 Agent 的消息]\n${data.message}` });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -541,21 +572,32 @@ async function runQuery(
   allowedTools: string[] = DEFAULT_ALLOWED_TOOLS,
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; interruptedDuringQuery: boolean }> {
   const stream = new MessageStream();
   stream.push(prompt, images);
   const emit = (output: ContainerOutput): void => {
     if (emitOutput) writeOutput(output);
   };
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
+  // Poll IPC for follow-up messages and _close/_interrupt sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
+  let interruptedDuringQuery = false;
+  // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
+  let queryRef: { interrupt(): Promise<void> } | null = null;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
+      stream.end();
+      ipcPolling = false;
+      return;
+    }
+    if (shouldInterrupt()) {
+      log('Interrupt sentinel detected, interrupting current query');
+      interruptedDuringQuery = true;
+      queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
       ipcPolling = false;
       return;
@@ -572,7 +614,12 @@ async function runQuery(
   // 文本聚合缓冲区 - 流式事件批量发送
   let textBuf = '', thinkBuf = '';
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let seenTextualResult = false;
   const FLUSH_MS = 100, FLUSH_CHARS = 200;
+  // 完整文本累积器 - SDK 的 result.result 仅包含最后一个文本块，
+  // 当 agent 在工具调用前后都有文本输出时，前面的文本会丢失。
+  // 用此累积器拼接所有 text_delta，作为最终消息的完整内容。
+  let fullTextAccumulator = '';
 
   function flushBuffers() {
     if (textBuf) {
@@ -694,16 +741,38 @@ async function runQuery(
     '`![描述](filename.png)`',
     '',
     '**禁止使用绝对路径**（如 `/workspace/group/filename.png`）。Web 界面会自动将相对路径解析为正确的文件下载地址。',
+    '',
+    '### 技术图表',
+    '需要输出技术图表（流程图、时序图、架构图、ER 图、类图、状态图、甘特图等）时，**使用 Mermaid 语法**，用 ```mermaid 代码块包裹。',
+    'Web 界面会自动将 Mermaid 代码渲染为可视化图表。',
+  ].join('\n');
+
+  const webFetchGuidelines = [
+    '',
+    '## 网页访问策略',
+    '',
+    '访问外部网页时优先使用 WebFetch（速度快）。',
+    '如果 WebFetch 失败（403、被拦截、内容为空或需要 JavaScript 渲染），',
+    '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
   ].join('\n');
 
   const systemPromptAppend = [
     globalClaudeMd,
     memoryRecall,
     outputGuidelines,
+    webFetchGuidelines,
   ].filter(Boolean).join('\n');
 
   // 追踪顶层工具执行状态（用于精确发送 tool_use_end）
   let activeTopLevelToolUseId: string | null = null;
+  // 追踪活跃的 Skill 工具 ID：Skill 内部调用的工具可能没有 parent_tool_use_id，
+  // 需要避免将它们误判为新的顶层工具而提前结束 Skill
+  let activeSkillToolUseId: string | null = null;
+
+  // 累积 Skill 工具的 input_json_delta 以提取 skillName
+  // （content_block_start 时 input 为空，实际 JSON 通过 delta 到达）
+  // 以 content block 索引（event.index）为 key，确保 delta 正确匹配到对应的 block
+  const pendingSkillInput: Map<number, { toolUseId: string; inputJson: string; resolved: boolean; parentToolUseId: string | null; isNested: boolean }> = new Map();
 
   // Home containers (admin & member) can access global and memory directories
   // Non-home containers only access memory (global CLAUDE.md injected via systemPromptAppend)
@@ -712,7 +781,7 @@ async function runQuery(
     : [WORKSPACE_MEMORY];
 
   try {
-    for await (const message of query({
+    const q = query({
     prompt: stream,
     options: {
       cwd: WORKSPACE_GROUP,
@@ -748,10 +817,12 @@ async function runQuery(
         PreCompact: [{ hooks: [createPreCompactHook(isHome, isAdminHome)] }]
       },
     }
-  })) {
+  });
+    queryRef = q;
+    for await (const message of q) {
     // 流式事件处理
     if (message.type === 'stream_event') {
-      const partial = message as any;
+      const partial = message;
       const parentToolUseId =
         partial.parent_tool_use_id === undefined ? null : partial.parent_tool_use_id;
       const isNested = parentToolUseId !== null;
@@ -760,14 +831,24 @@ async function runQuery(
       if (event.type === 'content_block_start') {
         const block = event.content_block;
         if (block?.type === 'tool_use') {
-          if (!isNested && activeTopLevelToolUseId && activeTopLevelToolUseId !== block.id) {
+          // 判断是否为 Skill 内部的工具调用：SDK 可能不设置 parent_tool_use_id，
+          // 但如果当前有活跃的 Skill 且此工具不是 Skill 本身，则视为嵌套
+          const isInsideSkill = !isNested && activeSkillToolUseId && block.name !== 'Skill';
+          const effectiveIsNested = isNested || !!isInsideSkill;
+          const effectiveParentToolUseId = isInsideSkill ? activeSkillToolUseId : parentToolUseId;
+
+          if (!effectiveIsNested && activeTopLevelToolUseId && activeTopLevelToolUseId !== block.id) {
             emit({
               status: 'stream',
               result: null,
               streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
             });
+            // 如果被结束的是 Skill 工具，清除 Skill 追踪
+            if (activeTopLevelToolUseId === activeSkillToolUseId) {
+              activeSkillToolUseId = null;
+            }
           }
-          if (!isNested) activeTopLevelToolUseId = block.id || null;
+          if (!effectiveIsNested) activeTopLevelToolUseId = block.id || null;
 
           emit({
             status: 'stream',
@@ -776,12 +857,28 @@ async function runQuery(
               eventType: 'tool_use_start',
               toolName: block.name,
               toolUseId: block.id,
-              parentToolUseId,
-              isNested,
+              parentToolUseId: effectiveParentToolUseId,
+              isNested: effectiveIsNested,
               skillName: extractSkillName(block.name, block.input),
               toolInputSummary: summarizeToolInput(block.input),
             },
           });
+
+          // 追踪 Skill 工具的 tool_use block — input 通过 delta 到达，start 时为空
+          // 使用 event.index（content block 索引）确保 delta 正确匹配
+          if (block.name === 'Skill' && block.id) {
+            activeSkillToolUseId = block.id;
+            const blockIndex = event.index;
+            if (typeof blockIndex === 'number') {
+              pendingSkillInput.set(blockIndex, {
+                toolUseId: block.id,
+                inputJson: '',
+                resolved: false,
+                parentToolUseId,
+                isNested,
+              });
+            }
+          }
         } else if (block?.type === 'text') {
           // 新的文本 block 开始意味着顶层工具已执行完毕
           if (activeTopLevelToolUseId) {
@@ -791,16 +888,46 @@ async function runQuery(
               streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
             });
             activeTopLevelToolUseId = null;
+            activeSkillToolUseId = null;
           }
         }
       } else if (event.type === 'content_block_delta') {
         const delta = event.delta;
         if (delta?.type === 'text_delta' && delta.text) {
           textBuf += delta.text;
+          fullTextAccumulator += delta.text;
           scheduleFlush();
         } else if (delta?.type === 'thinking_delta' && delta.thinking) {
           thinkBuf += delta.thinking;
           scheduleFlush();
+        } else if (delta?.type === 'input_json_delta' && delta.partial_json) {
+          // 累积 Skill 工具的 input JSON，提取 skillName
+          // 通过 content block 索引匹配，避免并行工具调用时的错误关联
+          const blockIndex = event.index;
+          if (typeof blockIndex === 'number') {
+            const pending = pendingSkillInput.get(blockIndex);
+            if (pending && !pending.resolved) {
+              pending.inputJson += delta.partial_json;
+              // 从累积的 JSON 中匹配 "skill":"value" 模式
+              const skillMatch = pending.inputJson.match(/"skill"\s*:\s*"([^"]+)"/);
+              if (skillMatch) {
+                pending.resolved = true;
+                pendingSkillInput.delete(blockIndex);
+                emit({
+                  status: 'stream',
+                  result: null,
+                  streamEvent: {
+                    eventType: 'tool_progress',
+                    toolName: 'Skill',
+                    toolUseId: pending.toolUseId,
+                    parentToolUseId: pending.parentToolUseId,
+                    isNested: pending.isNested,
+                    skillName: skillMatch[1],
+                  },
+                });
+              }
+            }
+          }
         }
       }
       continue; // stream_event 不走后续处理
@@ -896,6 +1023,41 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // 兜底：从完整的 assistant 消息中提取 skill 名称
+      // 处理 input_json_delta 事件未到达的情况
+      const assistantMsg = message as { message?: { content?: Array<{ type: string; name?: string; id?: string; input?: Record<string, unknown> }> } };
+      const content = assistantMsg.message?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'tool_use' && block.name === 'Skill' && block.id && block.input) {
+            const skillName = extractSkillName(block.name, block.input);
+            if (skillName) {
+              // 检查是否已通过 input_json_delta 解析过
+              let alreadyResolved = false;
+              for (const pending of pendingSkillInput.values()) {
+                if (pending.toolUseId === block.id && pending.resolved) {
+                  alreadyResolved = true;
+                  break;
+                }
+              }
+              if (!alreadyResolved) {
+                emit({
+                  status: 'stream',
+                  result: null,
+                  streamEvent: {
+                    eventType: 'tool_progress',
+                    toolName: 'Skill',
+                    toolUseId: block.id,
+                    skillName,
+                  },
+                });
+              }
+            }
+          }
+        }
+      }
+      // assistant 消息处理完毕，清空残留的 pendingSkillInput 避免内存泄漏
+      pendingSkillInput.clear();
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -912,28 +1074,51 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      // Emit pending deltas before final textual result, then mark to avoid
+      // emitting duplicated tail deltas in the post-loop cleanup flush.
+      if (textResult) {
+        if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+        flushBuffers();
+        seenTextualResult = true;
+      }
+      // SDK 的 result.result 仅包含最后一个文本块。当 agent 在工具调用前后
+      // 都有文本输出时，使用 fullTextAccumulator 作为完整内容。
+      const effectiveResult = fullTextAccumulator.length > (textResult?.length || 0)
+        ? fullTextAccumulator
+        : textResult;
       emit({
         status: 'success',
-        result: textResult || null,
+        result: effectiveResult || null,
         newSessionId
       });
+      // 重置累积器，为下一个 query 循环做准备
+      fullTextAccumulator = '';
     }
   }
 
   // 清理：先取消 pending timer，再 flush 剩余缓冲区，最后清除残留工具状态
   if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-  flushBuffers();
+  if (seenTextualResult) {
+    // Textual result already emitted. Drop any buffered tail to avoid
+    // stale stream residue in UI after message persistence.
+    textBuf = '';
+    thinkBuf = '';
+  } else {
+    flushBuffers();
+  }
   if (activeTopLevelToolUseId) {
     emit({
       status: 'stream',
       result: null,
       streamEvent: { eventType: 'tool_use_end', toolUseId: activeTopLevelToolUseId },
     });
+    activeTopLevelToolUseId = null;
+    activeSkillToolUseId = null;
   }
 
   ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}, interruptedDuringQuery: ${interruptedDuringQuery}`);
+  return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
   } catch (err) {
     ipcPolling = false;
     const errorMessage = err instanceof Error ? err.message : String(err);
@@ -941,7 +1126,7 @@ async function runQuery(
     // 检测上下文溢出错误
     if (isContextOverflowError(errorMessage)) {
       log(`Context overflow detected: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, contextOverflow: true, interruptedDuringQuery };
     }
 
     // 其他错误继续抛出
@@ -973,8 +1158,9 @@ async function main(): Promise<void> {
   const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
-  // Clean up stale _close sentinel from previous container runs
+  // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -998,6 +1184,9 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   try {
     while (true) {
+      // 清理残留的 _interrupt sentinel，防止空闲期间写入的中断信号影响下一次 query
+      try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
       const queryResult = await runQuery(
@@ -1051,6 +1240,27 @@ async function main(): Promise<void> {
       if (queryResult.closedDuringQuery) {
         log('Close sentinel consumed during query, exiting');
         break;
+      }
+
+      // 中断后：跳过 memory flush 和 session update，等待下一条消息
+      if (queryResult.interruptedDuringQuery) {
+        log('Query interrupted by user, waiting for next message');
+        writeOutput({
+          status: 'stream',
+          result: null,
+          streamEvent: { eventType: 'status', statusText: 'interrupted' },
+        });
+        // 清理可能残留的 _interrupt 文件
+        try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+        // 不 break，等待下一条消息
+        const nextMessage = await waitForIpcMessage();
+        if (nextMessage === null) {
+          log('Close sentinel received after interrupt, exiting');
+          break;
+        }
+        prompt = nextMessage.text;
+        promptImages = nextMessage.images;
+        continue;
       }
 
       // Memory Flush: run an extra query to let agent save durable memories (admin home only)

@@ -20,6 +20,7 @@ import {
 } from '../file-manager.js';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 
 // MIME 类型映射（预览和编辑端点共用）
 const MIME_MAP: Record<string, string> = {
@@ -127,6 +128,42 @@ const SAFE_PREVIEW_MIME_TYPES = new Set([
  */
 function getFileRootOverride(group: RegisteredGroup): string | undefined {
   return group.executionMode === 'host' && group.customCwd ? group.customCwd : undefined;
+}
+
+function buildAttachmentContentDisposition(fileName: string): string {
+  const sanitized = fileName.replace(/["\\\r\n]/g, '_');
+  const asciiFallback = sanitized.replace(/[^\x20-\x7E]/g, '_') || 'download';
+  const encoded = encodeURIComponent(fileName);
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encoded}`;
+}
+
+function parseSingleRange(
+  rangeHeader: string,
+  fileSize: number,
+): { start: number; end: number } | null {
+  if (fileSize <= 0) return null;
+
+  const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+  if (!match) return null;
+
+  const [, rawStart, rawEnd] = match;
+  if (!rawStart && !rawEnd) return null;
+
+  // Suffix bytes range (e.g. bytes=-500)
+  if (!rawStart) {
+    const suffixLength = Number(rawEnd);
+    if (!Number.isInteger(suffixLength) || suffixLength <= 0) return null;
+    if (suffixLength >= fileSize) return { start: 0, end: fileSize - 1 };
+    return { start: fileSize - suffixLength, end: fileSize - 1 };
+  }
+
+  const start = Number(rawStart);
+  if (!Number.isInteger(start) || start < 0 || start >= fileSize) return null;
+
+  const parsedEnd = rawEnd ? Number(rawEnd) : fileSize - 1;
+  if (!Number.isInteger(parsedEnd) || parsedEnd < start) return null;
+
+  return { start, end: Math.min(parsedEnd, fileSize - 1) };
 }
 
 const fileRoutes = new Hono<{ Variables: Variables }>();
@@ -286,19 +323,58 @@ fileRoutes.get('/:jid/files/download/:path', authMiddleware, (c) => {
       return c.json({ error: 'Cannot download directory' }, 400);
     }
 
-    // 读取文件并返回
-    const fileContent = fs.readFileSync(absolutePath);
     const fileName = path.basename(absolutePath);
+    const fileSize = stats.size;
+    const commonHeaders = {
+      'Content-Disposition': buildAttachmentContentDisposition(fileName),
+      'Content-Type': 'application/octet-stream',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; sandbox",
+      'Accept-Ranges': 'bytes',
+    };
 
-    c.header(
-      'Content-Disposition',
-      `attachment; filename="${encodeURIComponent(fileName)}"`,
-    );
-    c.header('Content-Type', 'application/octet-stream');
-    c.header('X-Content-Type-Options', 'nosniff');
-    c.header('Content-Security-Policy', "default-src 'none'; sandbox");
+    const rangeHeader = c.req.header('range');
+    if (rangeHeader) {
+      const normalizedRange = rangeHeader.trim();
+      const isBytesRange = normalizedRange.toLowerCase().startsWith('bytes=');
+      const isMultiRange = isBytesRange && normalizedRange.includes(',');
 
-    return c.body(fileContent);
+      // 多区间请求当前未实现 multipart/byteranges，回退为完整下载响应
+      if (isBytesRange && !isMultiRange) {
+        const parsedRange = parseSingleRange(normalizedRange, fileSize);
+        if (!parsedRange) {
+          return new Response(null, {
+            status: 416,
+            headers: {
+              ...commonHeaders,
+              'Content-Range': `bytes */${fileSize}`,
+            },
+          });
+        }
+
+        const { start, end } = parsedRange;
+        const stream = Readable.toWeb(
+          fs.createReadStream(absolutePath, { start, end }),
+        ) as ReadableStream<Uint8Array>;
+        return new Response(stream, {
+          status: 206,
+          headers: {
+            ...commonHeaders,
+            'Content-Length': String(end - start + 1),
+            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          },
+        });
+      }
+    }
+
+    const stream = Readable.toWeb(fs.createReadStream(absolutePath)) as ReadableStream<Uint8Array>;
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        ...commonHeaders,
+        'Content-Length': String(fileSize),
+      },
+    });
   } catch (error) {
     logger.error({ err: error }, `Failed to download file for ${jid}`);
     return c.json({ error: 'Failed to download file' }, 500);

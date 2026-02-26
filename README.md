@@ -431,10 +431,42 @@ make clean            # 清理构建产物
 make reset-init       # 重置为首装状态（清空数据库、配置、工作区、记忆、会话）
 ```
 
-| 服务 | 端口 | 说明 |
-|------|------|------|
+| 服务 | 默认端口 | 说明 |
+|------|---------|------|
 | 后端 | 3000 | Hono + WebSocket |
-| 前端开发服务器 | 5173 | Vite，代理 `/api` 和 `/ws` 到后端 |
+| 前端开发服务器 | 5173 | Vite，代理 `/api` 和 `/ws` 到后端（仅开发模式） |
+
+#### 自定义端口
+
+**生产模式**（`make start`）：只有后端服务，前端作为静态文件由后端托管，通过 `WEB_PORT` 环境变量修改端口：
+
+```bash
+# 方式一：.env 文件
+echo "WEB_PORT=8080" >> .env
+make start
+# 访问 http://localhost:8080
+
+# 方式二：命令行传入
+WEB_PORT=8080 make start
+```
+
+**开发模式**（`make dev`）：前端 Vite 开发服务器（`5173`）和后端（`3000`）分别运行，开发时访问 `5173`。
+
+修改后端端口：
+
+```bash
+# 后端改为 8080（通过 .env 或环境变量）
+WEB_PORT=8080 make dev-backend
+
+# 前端需同步修改代理目标，否则 API 请求会发到默认的 3000
+VITE_API_PROXY_TARGET=http://127.0.0.1:8080 VITE_WS_PROXY_TARGET=ws://127.0.0.1:8080 make dev-web
+```
+
+修改前端端口：通过 Vite CLI 参数覆盖：
+
+```bash
+cd web && npx vite --port 3001
+```
 
 ### 环境变量
 

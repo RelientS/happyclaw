@@ -26,6 +26,7 @@ interface GroupState {
   containerName: string | null;
   displayName: string | null;
   groupFolder: string | null;
+  agentId: string | null;
   retryCount: number;
   restarting: boolean;
 }
@@ -59,6 +60,7 @@ export class GroupQueue {
         containerName: null,
         displayName: null,
         groupFolder: null,
+        agentId: null,
         retryCount: 0,
         restarting: false,
       };
@@ -220,12 +222,25 @@ export class GroupQueue {
     containerName: string | null,
     groupFolder?: string,
     displayName?: string,
+    agentId?: string,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
     state.displayName = displayName || null;
     if (groupFolder) state.groupFolder = groupFolder;
+    state.agentId = agentId || null;
+  }
+
+  /**
+   * Resolve IPC input directory for a group state.
+   * Sub-agents use a nested path: data/ipc/{folder}/agents/{agentId}/input/
+   */
+  private resolveIpcInputDir(state: ActiveGroupState): string {
+    if (state.agentId) {
+      return path.join(DATA_DIR, 'ipc', state.groupFolder, 'agents', state.agentId, 'input');
+    }
+    return path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
   }
 
   /**
@@ -240,7 +255,7 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state) return false;
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
@@ -264,12 +279,35 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state) return;
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
     } catch {
       // ignore
+    }
+  }
+
+  /**
+   * Interrupt the current query for the same chat only (do not cross-interrupt
+   * sibling chats that share a serialized runner/folder).
+   *
+   * Writes a _interrupt sentinel that agent-runner detects and calls
+   * query.interrupt(). The container stays alive and accepts new messages.
+   */
+  interruptQuery(groupJid: string): boolean {
+    const own = this.groups.get(groupJid);
+    if (!own || !own.active || !own.groupFolder) return false;
+
+    const inputDir = own.agentId
+      ? path.join(DATA_DIR, 'ipc', own.groupFolder, 'agents', own.agentId, 'input')
+      : path.join(DATA_DIR, 'ipc', own.groupFolder, 'input');
+    try {
+      fs.mkdirSync(inputDir, { recursive: true });
+      fs.writeFileSync(path.join(inputDir, '_interrupt'), '');
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -514,6 +552,7 @@ export class GroupQueue {
       state.containerName = null;
       state.displayName = null;
       state.groupFolder = null;
+      state.agentId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
@@ -565,6 +604,7 @@ export class GroupQueue {
       state.containerName = null;
       state.displayName = null;
       state.groupFolder = null;
+      state.agentId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;

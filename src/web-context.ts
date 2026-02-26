@@ -4,7 +4,7 @@ import { WebSocket } from 'ws';
 import { RegisteredGroup, UserRole } from './types.js';
 import { GroupQueue } from './group-queue.js';
 import type { AuthUser, NewMessage, MessageCursor } from './types.js';
-import { getJidsByFolder, getRegisteredGroup } from './db.js';
+import { getJidsByFolder, getRegisteredGroup, getGroupMemberRole } from './db.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -18,7 +18,7 @@ export interface WebDeps {
   getSessions: () => Record<string, string>;
   processGroupMessages: (chatJid: string) => Promise<boolean>;
   ensureTerminalContainerStarted: (chatJid: string) => boolean;
-  formatMessages: (messages: NewMessage[]) => string;
+  formatMessages: (messages: NewMessage[], isShared?: boolean) => string;
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
   advanceGlobalCursor: (cursor: MessageCursor) => void;
@@ -29,6 +29,7 @@ export interface WebDeps {
   isTelegramConnected?: () => boolean;
   isUserFeishuConnected?: (userId: string) => boolean;
   isUserTelegramConnected?: (userId: string) => boolean;
+  processAgentConversation?: (chatJid: string, agentId: string) => Promise<void>;
 }
 
 export type Variables = {
@@ -102,7 +103,10 @@ export function canAccessGroup(
   // IM groups: check ownership if created_by is set.
   // For legacy rows without created_by, resolve owner from sibling home group.
   if (!group.jid.startsWith('web:')) {
-    if (group.created_by) return group.created_by === user.id;
+    if (group.created_by === user.id) return true;
+    // Check membership for IM groups sharing a non-home folder
+    if (getGroupMemberRole(group.folder, user.id) !== null) return true;
+    if (group.created_by) return false;
     const siblingJids = getJidsByFolder(group.folder);
     for (const jid of siblingJids) {
       if (jid === group.jid) continue;
@@ -115,7 +119,9 @@ export function canAccessGroup(
     return false;
   }
   if (group.folder === 'main') return false;
-  return group.created_by === user.id;
+  if (group.created_by === user.id) return true;
+  // Check group_members table for shared workspaces
+  return getGroupMemberRole(group.folder, user.id) !== null;
 }
 
 /**
@@ -132,6 +138,20 @@ export function canModifyGroup(
   if (group.is_home) return group.created_by === user.id;
   if (!group.jid.startsWith('web:')) return false;
   if (group.folder === 'main') return false;
+  return group.created_by === user.id;
+}
+
+/**
+ * Check if a user can manage members (add/remove) of a group.
+ * - Home groups cannot have members managed.
+ * - Only owner or admin can manage members.
+ */
+export function canManageGroupMembers(
+  user: { id: string; role: UserRole },
+  group: RegisteredGroup & { jid: string },
+): boolean {
+  if (group.is_home) return false;
+  if (user.role === 'admin') return true;
   return group.created_by === user.id;
 }
 

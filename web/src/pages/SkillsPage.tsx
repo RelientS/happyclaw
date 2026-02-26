@@ -138,14 +138,14 @@ export function SkillsPage() {
 
           {/* 右侧详情（桌面端） */}
           <div className="hidden lg:block lg:w-1/2 xl:w-3/5">
-            <SkillDetail skillId={selectedId} />
+            <SkillDetail skillId={selectedId} onDeleted={() => setSelectedId(null)} />
           </div>
         </div>
 
         {/* 移动端详情 */}
         {selectedId && (
           <div className="lg:hidden p-4">
-            <SkillDetail skillId={selectedId} />
+            <SkillDetail skillId={selectedId} onDeleted={() => setSelectedId(null)} />
           </div>
         )}
       </div>

@@ -1,17 +1,20 @@
 import { useState, useEffect } from 'react';
-import { File, Folder, Loader2, Lock } from 'lucide-react';
+import { File, Folder, Loader2, Lock, Trash2 } from 'lucide-react';
 import { useSkillsStore, type SkillDetail as SkillDetailType } from '../../stores/skills';
 import { MarkdownRenderer } from '../chat/MarkdownRenderer';
 
 interface SkillDetailProps {
   skillId: string | null;
+  onDeleted?: () => void;
 }
 
-export function SkillDetail({ skillId }: SkillDetailProps) {
+export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
   const [detail, setDetail] = useState<SkillDetailType | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const getSkillDetail = useSkillsStore((state) => state.getSkillDetail);
+  const deleteSkill = useSkillsStore((state) => state.deleteSkill);
 
   useEffect(() => {
     if (!skillId) {
@@ -86,21 +89,42 @@ export function SkillDetail({ skillId }: SkillDetailProps) {
             <p className="text-sm text-slate-600">{detail.description}</p>
           </div>
 
-          <div className="flex items-center gap-2">
-            <Lock size={16} className="text-slate-400" />
+          {detail.source === 'project' ? (
+            <div className="flex items-center gap-2">
+              <Lock size={16} className="text-slate-400" />
+              <div
+                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                  detail.enabled ? 'bg-primary' : 'bg-slate-300'
+                } opacity-50`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
+                    detail.enabled ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </div>
+            </div>
+          ) : (
             <button
-              disabled
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                detail.enabled ? 'bg-primary' : 'bg-slate-300'
-              } opacity-50 cursor-not-allowed`}
+              disabled={deleting}
+              onClick={async () => {
+                if (!confirm(`确认删除技能「${detail.name}」？`)) return;
+                setDeleting(true);
+                try {
+                  await deleteSkill(detail.id);
+                  onDeleted?.();
+                } catch {
+                  // error is handled by the store
+                } finally {
+                  setDeleting(false);
+                }
+              }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-red-600 hover:bg-red-50 transition-colors disabled:opacity-50"
             >
-              <span
-                className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
-                  detail.enabled ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
+              <Trash2 size={16} />
+              {deleting ? '删除中...' : '删除'}
             </button>
-          </div>
+          )}
         </div>
 
         {/* 元信息区域 */}
@@ -132,8 +156,8 @@ export function SkillDetail({ skillId }: SkillDetailProps) {
       {/* SKILL.md 内容 */}
       <div className="p-6 border-b border-slate-200">
         <h3 className="text-sm font-semibold text-slate-700 mb-3">技能说明</h3>
-        <div className="prose prose-sm max-w-none">
-          <MarkdownRenderer content={detail.content} />
+        <div className="max-w-none">
+          <MarkdownRenderer content={detail.content} variant="docs" />
         </div>
       </div>
 
@@ -166,8 +190,8 @@ export function SkillDetail({ skillId }: SkillDetailProps) {
       <div className="p-6 bg-slate-50">
         <p className="text-sm text-slate-500">
           {detail.source === 'user'
-            ? '宿主机技能为只读，如需修改请直接编辑 ~/.claude/skills/ 目录'
-            : '项目级技能不可修改'}
+            ? '用户级技能可删除，也可在对话中让 AI 安装或卸载技能'
+            : '项目级技能为只读，不可修改或删除'}
         </p>
       </div>
     </div>

@@ -3,7 +3,9 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { useState, memo } from 'react';
+import { createPortal } from 'react-dom';
 import { Copy, Check } from 'lucide-react';
+import { MermaidDiagram } from './MermaidDiagram';
 import { toBase64Url } from '../../stores/files';
 import { withBasePath } from '../../utils/url';
 import 'highlight.js/styles/github.css';
@@ -11,6 +13,7 @@ import 'highlight.js/styles/github.css';
 interface MarkdownRendererProps {
   content: string;
   groupJid?: string;
+  variant?: 'chat' | 'docs';
 }
 
 /** Resolve relative image paths to the file download API */
@@ -23,18 +26,19 @@ function resolveImageSrc(src: string, groupJid?: string): string {
 
 /** Image lightbox for markdown images */
 function MarkdownImageLightbox({ src, onClose }: { src: string; onClose: () => void }) {
-  return (
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center cursor-pointer"
       onClick={onClose}
     >
       <img
         src={src}
         alt="放大查看"
-        className="max-w-full max-h-full object-contain rounded-lg"
+        className="w-[90vw] h-[90vh] object-contain cursor-default"
         onClick={(e) => e.stopPropagation()}
       />
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -86,11 +90,21 @@ const sanitizeSchema = {
 };
 
 /** Code block / inline code renderer extracted from MarkdownRenderer */
-function CodeBlock({ className, children, ...props }: React.ComponentPropsWithoutRef<'code'> & { className?: string }) {
+function CodeBlock({
+  className,
+  children,
+  variant = 'chat',
+  ...props
+}: React.ComponentPropsWithoutRef<'code'> & { className?: string; variant?: 'chat' | 'docs' }) {
   const [copied, setCopied] = useState(false);
   const match = /language-(\w+)/.exec(className || '');
+  const lang = match?.[1];
   const isBlock = Boolean(match);
   const codeString = String(children).replace(/\n$/, '');
+
+  if (lang === 'mermaid') {
+    return <MermaidDiagram code={codeString} />;
+  }
 
   const handleCopy = () => {
     navigator.clipboard.writeText(codeString);
@@ -130,7 +144,11 @@ function CodeBlock({ className, children, ...props }: React.ComponentPropsWithou
 
   return (
     <code
-      className="bg-brand-50 text-primary px-1.5 py-0.5 rounded text-sm font-mono break-all"
+      className={
+        variant === 'chat'
+          ? 'bg-brand-50 text-primary px-1.5 py-0.5 rounded text-[0.9em] leading-relaxed font-mono break-all'
+          : 'bg-brand-50 text-primary px-1.5 py-0.5 rounded text-sm font-mono break-all'
+      }
       {...props}
     >
       {children}
@@ -138,74 +156,84 @@ function CodeBlock({ className, children, ...props }: React.ComponentPropsWithou
   );
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJid }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, groupJid, variant = 'chat' }: MarkdownRendererProps) {
+  const textSizeClass = variant === 'chat'
+    ? 'text-[15px] leading-7 text-slate-800'
+    : 'text-sm leading-6 text-slate-800';
+  const tableTextClass = variant === 'chat' ? 'text-[0.95em]' : 'text-sm';
+
   return (
-    <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
-      rehypePlugins={[rehypeHighlight, [rehypeSanitize, sanitizeSchema]]}
-      components={{
-        code: CodeBlock,
-        img: ({ src, alt }) => <MarkdownImage src={src ? resolveImageSrc(src, groupJid) : undefined} alt={alt} />,
-        a: ({ href, children }) => (
-          <a
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary hover:text-primary underline break-all"
-          >
-            {children}
-          </a>
-        ),
-        table: ({ children }) => (
-          <div className="overflow-x-auto my-4">
-            <table className="min-w-full border-collapse border border-slate-200">
+    <div className={textSizeClass}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeHighlight, { plainText: ['mermaid'] }], [rehypeSanitize, sanitizeSchema]]}
+        components={{
+          code: (props) => <CodeBlock {...props} variant={variant} />,
+          img: ({ src, alt }) => <MarkdownImage src={src ? resolveImageSrc(src, groupJid) : undefined} alt={alt} />,
+          a: ({ href, children }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-primary hover:text-primary underline break-all"
+            >
               {children}
-            </table>
-          </div>
-        ),
-        thead: ({ children }) => (
-          <thead className="bg-slate-50">{children}</thead>
-        ),
-        tbody: ({ children }) => <tbody className="divide-y divide-slate-200">{children}</tbody>,
-        tr: ({ children }) => (
-          <tr className="even:bg-white odd:bg-slate-50">
-            {children}
-          </tr>
-        ),
-        th: ({ children }) => (
-          <th className="px-4 py-2 text-left text-sm font-semibold text-slate-900 border border-slate-200">
-            {children}
-          </th>
-        ),
-        td: ({ children }) => (
-          <td className="px-4 py-2 text-sm text-slate-700 border border-slate-200">
-            {children}
-          </td>
-        ),
-        ul: ({ children }) => (
-          <ul className="list-disc list-inside my-2 space-y-1">{children}</ul>
-        ),
-        ol: ({ children }) => (
-          <ol className="list-decimal list-inside my-2 space-y-1">{children}</ol>
-        ),
-        p: ({ children }) => <p className="my-2 leading-relaxed">{children}</p>,
-        h1: ({ children }) => (
-          <h1 className="text-2xl font-bold mt-6 mb-4">{children}</h1>
-        ),
-        h2: ({ children }) => (
-          <h2 className="text-xl font-bold mt-5 mb-3">{children}</h2>
-        ),
-        h3: ({ children }) => (
-          <h3 className="text-lg font-semibold mt-4 mb-2">{children}</h3>
-        ),
-        blockquote: ({ children }) => (
-          <blockquote className="border-l-4 border-slate-300 pl-4 my-4 text-slate-600 italic">
-            {children}
-          </blockquote>
-        ),
-      }}
-    >
-      {content}
-    </ReactMarkdown>
+            </a>
+          ),
+          table: ({ children }) => (
+            <div
+              className="my-4 max-w-full overflow-x-auto overflow-y-hidden overscroll-x-contain [-webkit-overflow-scrolling:touch] [touch-action:pan-x]"
+              data-swipe-back-ignore="true"
+            >
+              <table className="w-max min-w-full border-collapse border border-slate-200">
+                {children}
+              </table>
+            </div>
+          ),
+          thead: ({ children }) => (
+            <thead className="bg-slate-50">{children}</thead>
+          ),
+          tbody: ({ children }) => <tbody className="divide-y divide-slate-200">{children}</tbody>,
+          tr: ({ children }) => (
+            <tr className="even:bg-white odd:bg-slate-50">
+              {children}
+            </tr>
+          ),
+          th: ({ children }) => (
+            <th className={`px-4 py-2 text-left font-semibold text-slate-900 border border-slate-200 whitespace-nowrap break-normal align-top ${tableTextClass}`}>
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className={`px-4 py-2 text-slate-700 border border-slate-200 whitespace-nowrap break-normal align-top ${tableTextClass}`}>
+              {children}
+            </td>
+          ),
+          ul: ({ children }) => (
+            <ul className="list-disc list-inside my-2 space-y-1">{children}</ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="list-decimal list-inside my-2 space-y-1">{children}</ol>
+          ),
+          p: ({ children }) => <p className="my-2">{children}</p>,
+          h1: ({ children }) => (
+            <h1 className="text-2xl font-bold mt-6 mb-4 leading-tight">{children}</h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="text-xl font-bold mt-5 mb-3 leading-tight">{children}</h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="text-lg font-semibold mt-4 mb-2 leading-snug">{children}</h3>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-4 border-slate-300 pl-4 my-4 text-slate-600 italic">
+              {children}
+            </blockquote>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
   );
 });

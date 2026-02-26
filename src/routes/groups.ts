@@ -4,6 +4,7 @@ import { authMiddleware } from '../middleware/auth.js';
 import {
   GroupCreateSchema,
   GroupPatchSchema,
+  GroupMemberAddSchema,
   ContainerEnvSchema,
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
@@ -14,6 +15,7 @@ import {
   canAccessGroup,
   canModifyGroup,
   canDeleteGroup,
+  canManageGroupMembers,
   MAX_GROUP_NAME_LEN,
   getWebDeps,
 } from '../web-context.js';
@@ -34,6 +36,13 @@ import {
   getMessagesAfter,
   getMessagesPageMulti,
   getMessagesAfterMulti,
+  addGroupMember,
+  removeGroupMember,
+  getGroupMembers,
+  getGroupMemberRole,
+  getUserById,
+  getAgent,
+  listUsers,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -55,7 +64,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
 import { z } from 'zod';
-import { broadcastNewMessage } from '../web.js';
+import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -118,23 +127,26 @@ function normalizeGroupName(name: unknown): string {
   return name.trim().slice(0, MAX_GROUP_NAME_LEN);
 }
 
-function buildGroupsPayload(user: AuthUser): Record<
-  string,
-  {
-    name: string;
-    folder: string;
-    added_at: string;
-    kind: 'home' | 'feishu' | 'web';
-    editable: boolean;
-    deletable: boolean;
-    lastMessage?: string;
-    lastMessageTime?: string;
-    execution_mode: 'container' | 'host';
-    custom_cwd?: string;
-    is_home?: boolean;
-    is_my_home?: boolean;
-  }
-> {
+interface GroupPayloadItem {
+  name: string;
+  folder: string;
+  added_at: string;
+  kind: 'home' | 'feishu' | 'web';
+  editable: boolean;
+  deletable: boolean;
+  lastMessage?: string;
+  lastMessageTime?: string;
+  execution_mode: 'container' | 'host';
+  custom_cwd?: string;
+  is_home?: boolean;
+  is_my_home?: boolean;
+  is_shared?: boolean;
+  member_role?: 'owner' | 'member';
+  member_count?: number;
+  selected_skills?: string[] | null;
+}
+
+function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   const groups = getAllRegisteredGroups();
   const chats = new Map(getAllChats().map((chat) => [chat.jid, chat]));
   const isAdmin = hasHostExecutionPermission(user);
@@ -144,23 +156,7 @@ function buildGroupsPayload(user: AuthUser): Record<
       .map(([_, group]) => group.folder),
   );
 
-  const result: Record<
-    string,
-    {
-      name: string;
-      folder: string;
-      added_at: string;
-      kind: 'home' | 'feishu' | 'web';
-      editable: boolean;
-      deletable: boolean;
-      lastMessage?: string;
-      lastMessageTime?: string;
-      execution_mode: 'container' | 'host';
-      custom_cwd?: string;
-      is_home?: boolean;
-      is_my_home?: boolean;
-    }
-  > = {};
+  const result: Record<string, GroupPayloadItem> = {};
 
   // 先过滤出要显示的群组 jid
   const visibleEntries: Array<[string, typeof groups[string]]> = [];
@@ -199,11 +195,26 @@ function buildGroupsPayload(user: AuthUser): Record<
     }
   }
 
+  // Cache member info per folder (avoid repeated queries)
+  const memberCache = new Map<string, { count: number; role: 'owner' | 'member' | null }>();
+  function getMemberInfo(folder: string) {
+    let cached = memberCache.get(folder);
+    if (!cached) {
+      const members = getGroupMembers(folder);
+      const role = members.find((m) => m.user_id === user.id)?.role ?? null;
+      cached = { count: members.length, role };
+      memberCache.set(folder, cached);
+    }
+    return cached;
+  }
+
   for (const [jid, group] of visibleEntries) {
     const isHome = !!group.is_home;
     const isWeb = jid.startsWith('web:');
 
     const latest = latestByJid.get(jid);
+    const memberInfo = !isHome ? getMemberInfo(group.folder) : null;
+    const isShared = memberInfo ? memberInfo.count > 1 : false;
 
     result[jid] = {
       name: group.name,
@@ -221,6 +232,10 @@ function buildGroupsPayload(user: AuthUser): Record<
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
       is_my_home: (isHome && group.created_by === user.id) || undefined,
+      is_shared: isShared || undefined,
+      member_role: memberInfo?.role ?? undefined,
+      member_count: isShared ? memberInfo?.count : undefined,
+      selected_skills: group.selected_skills ?? null,
     };
   }
 
@@ -518,6 +533,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   updateChatName(jid, name);
   deps.getRegisteredGroups()[jid] = group;
 
+  // Register creator as owner in group_members
+  addGroupMember(folder, authUser.id, 'owner', authUser.id);
+
   // 工作区初始化
   const groupDir = path.join(GROUPS_DIR, folder);
 
@@ -565,6 +583,9 @@ groupRoutes.post('/', authMiddleware, async (c) => {
       deletable: true,
       lastMessage: undefined,
       lastMessageTime: now,
+      member_role: 'owner',
+      member_count: 1,
+      is_shared: false,
     },
   });
 });
@@ -603,11 +624,17 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       400,
     );
   }
-  const name = normalizeGroupName(validation.data.name);
-  if (!name) return c.json({ error: 'Group name is required' }, 400);
+
+  const { name: rawName, selected_skills } = validation.data;
+  const name = rawName ? normalizeGroupName(rawName) : undefined;
+
+  // 至少需要提供一个字段
+  if (!name && selected_skills === undefined) {
+    return c.json({ error: 'No fields to update' }, 400);
+  }
 
   const updated: RegisteredGroup = {
-    name,
+    name: name || existing.name,
     folder: existing.folder,
     added_at: existing.added_at,
     containerConfig: existing.containerConfig,
@@ -615,10 +642,11 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     customCwd: existing.customCwd,
     created_by: existing.created_by,
     is_home: existing.is_home,
+    selected_skills: selected_skills !== undefined ? (selected_skills ?? null) : existing.selected_skills,
   };
 
   setRegisteredGroup(jid, updated);
-  updateChatName(jid, name);
+  if (name) updateChatName(jid, name);
   deps.getRegisteredGroups()[jid] = updated;
 
   return c.json({ success: true });
@@ -672,6 +700,74 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   return c.json({ success: true });
 });
 
+// POST /api/groups/:jid/stop - 停止当前运行的容器/进程
+groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  try {
+    await deps.queue.stopGroup(jid);
+    return c.json({ success: true });
+  } catch (err) {
+    logger.error({ jid, err }, 'Failed to stop group');
+    return c.json({ error: 'Failed to stop container' }, 500);
+  }
+});
+
+// POST /api/groups/:jid/interrupt - 中断当前查询（不杀容器）
+groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const interrupted = deps.queue.interruptQuery(jid);
+  if (interrupted) {
+    // Persist interrupt as a system marker so refresh/state-restore can
+    // deterministically clear waiting even when no assistant reply exists.
+    const messageId = crypto.randomUUID();
+    const timestamp = new Date().toISOString();
+    try {
+      ensureChatExists(jid);
+      storeMessageDirect(
+        messageId,
+        jid,
+        '__system__',
+        'system',
+        'query_interrupted',
+        timestamp,
+        true,
+      );
+      broadcastNewMessage(jid, {
+        id: messageId,
+        chat_jid: jid,
+        sender: '__system__',
+        sender_name: 'system',
+        content: 'query_interrupted',
+        timestamp,
+        is_from_me: true,
+      });
+    } catch (err) {
+      logger.warn({ jid, err }, 'Interrupt succeeded but failed to append system marker');
+    }
+  }
+  return c.json({ success: true, interrupted });
+});
+
 // POST /api/groups/:jid/reset-session - 重置会话上下文
 groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const deps = getWebDeps();
@@ -681,7 +777,7 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
   const group = getRegisteredGroup(jid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
@@ -787,7 +883,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   const group = getRegisteredGroup(jid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
     return c.json({ error: 'Group not found' }, 404);
   }
   if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
@@ -874,8 +970,27 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
 
   const before = c.req.query('before');
   const after = c.req.query('after');
+  const agentIdParam = c.req.query('agentId');
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 50, 200);
+
+  // Agent conversation: query messages from the virtual chat_jid
+  if (agentIdParam) {
+    const agent = getAgent(agentIdParam);
+    if (!agent || agent.chat_jid !== jid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+
+    const virtualJid = `${jid}#agent:${agentIdParam}`;
+    if (after) {
+      const messages = getMessagesAfter(virtualJid, after, limit);
+      return c.json({ messages });
+    }
+    const rows = getMessagesPage(virtualJid, before, limit + 1);
+    const hasMore = rows.length > limit;
+    const messages = hasMore ? rows.slice(0, limit) : rows;
+    return c.json({ messages, hasMore });
+  }
 
   // is_home 群组合并查询：将同 folder 下所有 JID（web + feishu/telegram IM 通道）的消息合并展示
   // - admin: merge all siblings in the folder (shared admin home)
@@ -1042,6 +1157,131 @@ groupRoutes.put('/:jid/env', authMiddleware, async (c) => {
     logger.error({ err }, 'Failed to save container env config');
     return c.json({ error: 'Failed to save config' }, 500);
   }
+});
+
+// --- Member Management Routes ---
+
+// GET /api/groups/:jid/members - 列出成员
+groupRoutes.get('/:jid/members', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const members = getGroupMembers(group.folder);
+  return c.json({ members });
+});
+
+// GET /api/groups/:jid/members/search?q=... - 搜索可添加的用户（owner/admin 权限）
+groupRoutes.get('/:jid/members/search', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const q = c.req.query('q') || '';
+  if (!q.trim()) return c.json({ users: [] });
+
+  const result = listUsers({ query: q.trim(), status: 'active', pageSize: 10 });
+  const existingIds = new Set(getGroupMembers(group.folder).map((m) => m.user_id));
+  const users = result.users
+    .filter((u) => !existingIds.has(u.id))
+    .map((u) => ({ id: u.id, username: u.username, display_name: u.display_name }));
+
+  return c.json({ users });
+});
+
+// POST /api/groups/:jid/members - 添加成员
+groupRoutes.post('/:jid/members', authMiddleware, async (c) => {
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Insufficient permissions' }, 403);
+  }
+
+  if (group.is_home) {
+    return c.json({ error: 'Cannot add members to home groups' }, 400);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const validation = GroupMemberAddSchema.safeParse(body);
+  if (!validation.success) {
+    return c.json({ error: 'Invalid request body' }, 400);
+  }
+
+  const { user_id: targetUserId } = validation.data;
+
+  // Check target user exists and is active
+  const targetUser = getUserById(targetUserId);
+  if (!targetUser || targetUser.status !== 'active') {
+    return c.json({ error: 'User not found or inactive' }, 404);
+  }
+
+  // Check if already a member
+  const existingRole = getGroupMemberRole(group.folder, targetUserId);
+  if (existingRole !== null) {
+    return c.json({ error: 'User is already a member' }, 409);
+  }
+
+  addGroupMember(group.folder, targetUserId, 'member', authUser.id);
+  invalidateAllowedUserCache(jid);
+  logger.info(
+    { jid, folder: group.folder, targetUserId, addedBy: authUser.id },
+    'Group member added',
+  );
+
+  const members = getGroupMembers(group.folder);
+  return c.json({ success: true, members });
+});
+
+// DELETE /api/groups/:jid/members/:userId - 移除成员
+groupRoutes.delete('/:jid/members/:userId', authMiddleware, (c) => {
+  const jid = c.req.param('jid');
+  const targetUserId = c.req.param('userId');
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+
+  const authUser = c.get('user') as AuthUser;
+
+  // Self-removal: any member can leave
+  const isSelfRemoval = targetUserId === authUser.id;
+  if (!isSelfRemoval) {
+    if (!canManageGroupMembers({ id: authUser.id, role: authUser.role }, group)) {
+      return c.json({ error: 'Insufficient permissions' }, 403);
+    }
+  }
+
+  // Check target is actually a member
+  const targetRole = getGroupMemberRole(group.folder, targetUserId);
+  if (targetRole === null) {
+    return c.json({ error: 'User is not a member' }, 404);
+  }
+
+  // Owner cannot be removed
+  if (targetRole === 'owner') {
+    return c.json({ error: 'Cannot remove the owner' }, 400);
+  }
+
+  removeGroupMember(group.folder, targetUserId);
+  invalidateAllowedUserCache(jid);
+  logger.info(
+    { jid, folder: group.folder, targetUserId, removedBy: authUser.id, isSelfRemoval },
+    'Group member removed',
+  );
+
+  const members = getGroupMembers(group.folder);
+  return c.json({ success: true, members });
 });
 
 export default groupRoutes;

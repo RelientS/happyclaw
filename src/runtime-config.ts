@@ -191,8 +191,9 @@ function normalizeSecret(input: unknown, fieldName: string): string {
   if (typeof input !== 'string') {
     throw new Error(`Invalid field: ${fieldName}`);
   }
-  // Strip control characters that could inject extra env lines
-  const value = input.replace(/[\r\n\0]/g, '').trim();
+  // Strip ALL whitespace — API keys/tokens never contain spaces;
+  // users often paste with accidental spaces or line breaks.
+  const value = input.replace(/\s+/g, '');
   if (value.length > MAX_FIELD_LENGTH) {
     throw new Error(`Field too long: ${fieldName}`);
   }
@@ -783,6 +784,20 @@ export function saveClaudeProviderConfig(
 /** Strip control characters from a value before writing to env file (defense-in-depth) */
 function sanitizeEnvValue(value: string): string {
   return value.replace(/[\r\n\0]/g, '');
+}
+
+/** Convert KEY=value lines to shell-safe format by single-quoting values.
+ *  Used when writing env files that are `source`d by bash. */
+export function shellQuoteEnvLines(lines: string[]): string[] {
+  return lines.map((line) => {
+    const eqIdx = line.indexOf('=');
+    if (eqIdx <= 0) return line;
+    const key = line.slice(0, eqIdx);
+    const value = line.slice(eqIdx + 1);
+    // Escape embedded single quotes: ' → '\''
+    const quoted = "'" + value.replace(/'/g, "'\\''") + "'";
+    return `${key}=${quoted}`;
+  });
 }
 
 export function buildClaudeEnvLines(config: ClaudeProviderConfig): string[] {

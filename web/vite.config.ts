@@ -7,6 +7,16 @@ import { VitePWA } from 'vite-plugin-pwa';
 const API_PROXY_TARGET = process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:3000';
 const WS_PROXY_TARGET = process.env.VITE_WS_PROXY_TARGET || 'ws://127.0.0.1:3000';
 const ENABLE_DEV_PWA = process.env.VITE_PWA_DEV === 'true';
+const MERMAID_RUNTIME_CHUNK_PATTERNS = [
+  /(^|\/)assets\/mermaid(?:\.core)?-[^/]+\.js$/i,
+  /(^|\/)assets\/(?:architectureDiagram|blockDiagram|c4Diagram|classDiagram(?:-v2)?|erDiagram|flowDiagram|ganttDiagram|gitGraphDiagram|infoDiagram|journeyDiagram|kanban-definition|mindmap-definition|pieDiagram|quadrantDiagram|requirementDiagram|sankeyDiagram|sequenceDiagram|stateDiagram(?:-v2)?|timeline-definition|xychartDiagram)-[^/]+\.js$/i,
+  /(^|\/)assets\/(?:cytoscape\.esm|cose-bilkent|dagre|katex|treemap|layout|graph)-[^/]+\.js$/i,
+];
+
+function isMermaidRuntimeChunk(urlPath: string): boolean {
+  return MERMAID_RUNTIME_CHUNK_PATTERNS.some((pattern) => pattern.test(urlPath));
+}
+
 const APP_BASE = (() => {
   const raw = (process.env.VITE_BASE_PATH || '/').trim();
   if (!raw) return '/';
@@ -100,6 +110,10 @@ export default defineConfig(({ command }) => {
           },
           workbox: {
             navigateFallback: `${APP_BASE}index.html`,
+            manifestTransforms: [async (entries) => ({
+              manifest: entries.filter((entry) => !isMermaidRuntimeChunk(entry.url)),
+              warnings: [],
+            })],
             runtimeCaching: [
               {
                 urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
@@ -120,6 +134,22 @@ export default defineConfig(({ command }) => {
                   expiration: {
                     maxEntries: 10,
                     maxAgeSeconds: 60 * 60 * 24 * 365,
+                  },
+                },
+              },
+              {
+                urlPattern: ({ url }) => {
+                  const p = url.pathname;
+                  return /(^|\/)assets\/mermaid(?:\.core)?-[^/]+\.js$/i.test(p)
+                    || /(^|\/)assets\/(?:architectureDiagram|blockDiagram|c4Diagram|classDiagram(?:-v2)?|erDiagram|flowDiagram|ganttDiagram|gitGraphDiagram|infoDiagram|journeyDiagram|kanban-definition|mindmap-definition|pieDiagram|quadrantDiagram|requirementDiagram|sankeyDiagram|sequenceDiagram|stateDiagram(?:-v2)?|timeline-definition|xychartDiagram)-[^/]+\.js$/i.test(p)
+                    || /(^|\/)assets\/(?:cytoscape\.esm|cose-bilkent|dagre|katex|treemap|layout|graph)-[^/]+\.js$/i.test(p);
+                },
+                handler: 'StaleWhileRevalidate',
+                options: {
+                  cacheName: 'mermaid-runtime-cache',
+                  expiration: {
+                    maxEntries: 64,
+                    maxAgeSeconds: 60 * 60 * 24 * 30,
                   },
                 },
               },

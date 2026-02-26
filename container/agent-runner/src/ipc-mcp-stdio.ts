@@ -271,6 +271,258 @@ Use available_groups.json to find the JID for a group. The folder name should be
   },
 );
 
+// --- Sub-Agent tools ---
+
+const AGENTS_DIR = path.join(IPC_DIR, 'agents');
+
+server.tool(
+  'spawn_agent',
+  `Spawn a sub-agent to work on a task in parallel. The sub-agent runs independently with its own context and can access the same workspace files.
+
+Use this when you identify tasks that can be parallelized. For example:
+- "Implement the login page" + "Implement the API endpoints" → spawn both in parallel
+- "Research library X" + "Research library Y" → spawn both, compare results when done
+
+The sub-agent will execute autonomously and its result will be injected back into your conversation when it completes. You can continue working on other things while sub-agents run.
+
+Limitations:
+- Sub-agents share the same workspace files (coordinate to avoid conflicts)
+- Sub-agents cannot spawn their own sub-agents
+- Results are delivered asynchronously — use list_agents to check status`,
+  {
+    name: z.string().describe('Short descriptive name for the agent (e.g., "前端开发", "API调试")'),
+    prompt: z.string().describe('The task prompt for the sub-agent. Be specific and self-contained.'),
+  },
+  async (args) => {
+    const agentId = `agt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    fs.mkdirSync(AGENTS_DIR, { recursive: true });
+
+    const data = {
+      type: 'spawn_agent',
+      agentId,
+      name: args.name,
+      prompt: args.prompt,
+      chatJid,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(AGENTS_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Sub-agent "${args.name}" spawned (ID: ${agentId}). It will run independently and results will be injected into your conversation when complete. Use list_agents to check status.`,
+      }],
+    };
+  },
+);
+
+server.tool(
+  'message_agent',
+  `Send a message to a running sub-agent. Use this to relay information from other agents, provide additional instructions, or send follow-up context.`,
+  {
+    agent_id: z.string().describe('The sub-agent ID (e.g., "agt-xxx")'),
+    message: z.string().describe('The message to send to the sub-agent'),
+  },
+  async (args) => {
+    fs.mkdirSync(AGENTS_DIR, { recursive: true });
+
+    const data = {
+      type: 'message_agent',
+      agentId: args.agent_id,
+      message: args.message,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(AGENTS_DIR, data);
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: `Message sent to agent ${args.agent_id}.`,
+      }],
+    };
+  },
+);
+
+server.tool(
+  'list_agents',
+  `List all sub-agents and their current status. Shows running, completed, and errored agents.`,
+  {},
+  async () => {
+    const statusFile = path.join(AGENTS_DIR, 'status.json');
+    try {
+      if (!fs.existsSync(statusFile)) {
+        return { content: [{ type: 'text' as const, text: 'No sub-agents found.' }] };
+      }
+
+      const agents = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+      if (!Array.isArray(agents) || agents.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No sub-agents found.' }] };
+      }
+
+      const formatted = agents.map(
+        (a: { id: string; name: string; status: string; result_summary?: string; created_at: string }) => {
+          const statusIcon = a.status === 'running' ? '🔄' : a.status === 'completed' ? '✅' : '❌';
+          let line = `${statusIcon} [${a.id}] ${a.name} — ${a.status}`;
+          if (a.result_summary) {
+            line += `\n   Result: ${a.result_summary.slice(0, 200)}`;
+          }
+          return line;
+        },
+      ).join('\n');
+
+      return {
+        content: [{ type: 'text' as const, text: `Sub-agents:\n${formatted}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading agent status: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
+  },
+);
+
+// --- Skill installation tool ---
+
+server.tool(
+  'install_skill',
+  `Install a skill from the skills registry (skills.sh). The skill will be available in future conversations.
+Example packages: "anthropic/memory", "anthropic/think", "owner/repo", "owner/repo@skill-name".`,
+  {
+    package: z.string().describe('The skill package to install, format: owner/repo or owner/repo@skill'),
+  },
+  async (args) => {
+    const pkg = args.package.trim();
+    if (!/^[\w\-]+\/[\w\-.]+(?:[@#][\w\-.\/]+)?$/.test(pkg)) {
+      return {
+        content: [{ type: 'text' as const, text: `Invalid package format: "${pkg}". Expected format: owner/repo or owner/repo@skill` }],
+        isError: true,
+      };
+    }
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const resultFileName = `install_skill_result_${requestId}.json`;
+    const resultFilePath = path.join(TASKS_DIR, resultFileName);
+
+    // Write IPC request
+    const data = {
+      type: 'install_skill',
+      package: pkg,
+      requestId,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Poll for result file (timeout 120s)
+    const timeout = 120_000;
+    const pollInterval = 500;
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      try {
+        if (fs.existsSync(resultFilePath)) {
+          const raw = fs.readFileSync(resultFilePath, 'utf-8');
+          fs.unlinkSync(resultFilePath);
+          const result = JSON.parse(raw);
+
+          if (result.success) {
+            const installed = (result.installed || []).join(', ') || pkg;
+            return {
+              content: [{ type: 'text' as const, text: `Skill installed successfully: ${installed}\n\nNote: The skill will be available in the next conversation (new container/process).` }],
+            };
+          } else {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to install skill "${pkg}": ${result.error || 'Unknown error'}` }],
+              isError: true,
+            };
+          }
+        }
+      } catch {
+        // ignore read errors, retry
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Timeout waiting for skill installation result (${timeout / 1000}s). The installation may still be in progress.` }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
+  'uninstall_skill',
+  `Uninstall a user-level skill by its ID. Project-level skills cannot be uninstalled.
+Use the skills panel in the UI to find the skill ID (directory name, e.g. "memory", "think").`,
+  {
+    skill_id: z.string().describe('The skill ID to uninstall (the directory name, e.g. "memory", "think")'),
+  },
+  async (args) => {
+    const skillId = args.skill_id.trim();
+    if (!skillId || !/^[\w\-]+$/.test(skillId)) {
+      return {
+        content: [{ type: 'text' as const, text: `Invalid skill ID: "${skillId}". Must be alphanumeric with hyphens/underscores.` }],
+        isError: true,
+      };
+    }
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const resultFileName = `uninstall_skill_result_${requestId}.json`;
+    const resultFilePath = path.join(TASKS_DIR, resultFileName);
+
+    const data = {
+      type: 'uninstall_skill',
+      skillId,
+      requestId,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    // Poll for result file (timeout 30s — uninstall is fast)
+    const timeout = 30_000;
+    const pollInterval = 500;
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      try {
+        if (fs.existsSync(resultFilePath)) {
+          const raw = fs.readFileSync(resultFilePath, 'utf-8');
+          fs.unlinkSync(resultFilePath);
+          const result = JSON.parse(raw);
+
+          if (result.success) {
+            return {
+              content: [{ type: 'text' as const, text: `Skill "${skillId}" uninstalled successfully.` }],
+            };
+          } else {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to uninstall skill "${skillId}": ${result.error || 'Unknown error'}` }],
+              isError: true,
+            };
+          }
+        }
+      } catch {
+        // ignore read errors, retry
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Timeout waiting for skill uninstall result.` }],
+      isError: true,
+    };
+  },
+);
+
 // --- Memory tools ---
 
 const WORKSPACE_GROUP = process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';

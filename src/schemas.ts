@@ -96,6 +96,10 @@ export const GroupCreateSchema = z.object({
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
 });
 
+export const GroupMemberAddSchema = z.object({
+  user_id: z.string().min(1),
+});
+
 export const MemoryFileSchema = z.object({
   path: z.string().min(1),
   content: z.string(),
@@ -110,7 +114,8 @@ export const ClaudeConfigSchema = z.object({
 });
 
 export const GroupPatchSchema = z.object({
-  name: z.string().min(1).max(MAX_GROUP_NAME_LEN),
+  name: z.string().min(1).max(MAX_GROUP_NAME_LEN).optional(),
+  selected_skills: z.array(z.string().max(128)).max(200).nullable().optional(),
 });
 
 export const LoginSchema = z.object({
@@ -295,6 +300,36 @@ export const TerminalResizeSchema = z.object({
 
 export const TerminalStopSchema = z.object({
   chatJid: z.string().min(1),
+});
+
+// Workspace schemas
+export const WorkspaceCreateSchema = z.object({
+  name: z.string().min(1).max(100),
+  execution_mode: z.enum(['container', 'host']).optional(),
+  max_parallel_tasks: z.number().int().min(1).max(10).optional(),
+});
+
+export const WorkspaceUpdateSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  max_parallel_tasks: z.number().int().min(1).max(10).optional(),
+});
+
+export const WorkspaceMemberAddSchema = z.object({
+  user_id: z.string().min(1),
+  role: z.enum(['owner', 'admin', 'member', 'viewer']).optional(),
+});
+
+export const WorkspaceJoinSchema = z.object({
+  invite_code: z.string().min(1),
+});
+
+export const WorkspaceBindGroupSchema = z.object({
+  group_jid: z.string().min(1),
+});
+
+export const WorkspaceInviteCreateSchema = z.object({
+  expires_in_hours: z.number().int().min(1).max(8760).optional(), // 默认 24 小时，最长 1 年
+  max_uses: z.number().int().min(0).max(1000).optional(), // 0 = 无限次，默认 0
 });
 
 // Memory types

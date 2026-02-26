@@ -39,21 +39,34 @@ export function SkillCard({ skill, selected, onSelect }: SkillCardProps) {
           <p className="text-sm text-slate-500 line-clamp-2">{skill.description}</p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <Lock size={16} className="text-slate-400" />
-          <button
-            disabled
-            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-              skill.enabled ? 'bg-primary' : 'bg-slate-300'
-            } opacity-50 cursor-not-allowed`}
-          >
+        {skill.source === 'project' && (
+          <div className="flex items-center gap-2">
+            <Lock size={16} className="text-slate-400" />
+            <div
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                skill.enabled ? 'bg-primary' : 'bg-slate-300'
+              } opacity-50`}
+            >
+              <span
+                className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
+                  skill.enabled ? 'translate-x-6' : 'translate-x-1'
+                }`}
+              />
+            </div>
+          </div>
+        )}
+
+        {skill.source === 'user' && (
+          <div className="flex items-center">
             <span
-              className={`inline-block h-4 w-4 rounded-full bg-white transition-transform ${
-                skill.enabled ? 'translate-x-6' : 'translate-x-1'
+              className={`inline-flex h-5 px-2 items-center rounded text-xs font-medium ${
+                skill.enabled ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'
               }`}
-            />
-          </button>
-        </div>
+            >
+              {skill.enabled ? '已启用' : '已禁用'}
+            </span>
+          </div>
+        )}
       </div>
     </button>
   );

@@ -1,14 +1,31 @@
-import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Message, useChatStore } from '../../stores/chat';
+import type { AgentInfo } from '../../types';
 import { MessageBubble } from './MessageBubble';
-import { Loader2, ChevronUp, ChevronDown, AlertTriangle } from 'lucide-react';
+import { StreamingDisplay } from './StreamingDisplay';
+import { AgentStatusCard } from './AgentStatusCard';
+import { Loader2, ChevronUp, ChevronDown, AlertTriangle, Square } from 'lucide-react';
 
 interface MessageListProps {
   messages: Message[];
   loading: boolean;
   hasMore: boolean;
   onLoadMore: () => void;
+  /** Increment to force scroll to bottom (e.g. after sending a message) */
+  scrollTrigger?: number;
+  /** Current group JID — used to save/restore scroll position across group switches */
+  groupJid?: string;
+  /** Whether the agent is currently processing */
+  isWaiting?: boolean;
+  /** Callback to interrupt the current agent query */
+  onInterrupt?: () => void;
+  /** Sub-agents to display as status cards in the main conversation */
+  agents?: AgentInfo[];
+  /** Callback when a sub-agent status card is clicked */
+  onAgentClick?: (agentId: string) => void;
+  /** If set, this MessageList is showing a sub-agent's messages */
+  agentId?: string;
 }
 
 type FlatItem =
@@ -17,8 +34,9 @@ type FlatItem =
   | { type: 'error'; content: string }
   | { type: 'message'; content: Message };
 
-export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageListProps) {
+export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrigger, groupJid, isWaiting, onInterrupt, agents, onAgentClick, agentId }: MessageListProps) {
   const thinkingCache = useChatStore(s => s.thinkingCache ?? {});
+  const isShared = useChatStore(s => !!s.groups[groupJid ?? '']?.is_shared);
   const parentRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
   const [atTop, setAtTop] = useState(false);
@@ -57,9 +75,12 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
     return items;
   }, [messages]);
 
+  // Chat always starts at bottom — no scroll position restoration.
+  // key={...} on <MessageList> guarantees a fresh mount on group/tab switch.
   const virtualizer = useVirtualizer({
     count: flatMessages.length,
     getScrollElement: () => parentRef.current,
+    initialOffset: flatMessages.length > 0 ? 99999999 : 0,
     getItemKey: (index) => {
       const item = flatMessages[index];
       if (!item) return index;
@@ -90,7 +111,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
     overscan: 8,
   });
 
-  // 检测向上滚动触发 loadMore
+  // 检测向上滚动触发 loadMore + 保存滚动位置
   useEffect(() => {
     const parent = parentRef.current;
     if (!parent) return;
@@ -108,27 +129,67 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
 
     parent.addEventListener('scroll', handleScroll);
     return () => parent.removeEventListener('scroll', handleScroll);
-  }, [hasMore, loading, onLoadMore]);
+  }, [hasMore, loading, onLoadMore, groupJid]);
 
   // 新消息自动滚到底部
   useEffect(() => {
     if (autoScroll && messages.length > prevMessageCount.current) {
-      parentRef.current?.scrollTo({
-        top: parentRef.current.scrollHeight,
-        behavior: 'smooth',
+      requestAnimationFrame(() => {
+        parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight, behavior: 'smooth' });
       });
     }
     prevMessageCount.current = messages.length;
-  }, [messages, autoScroll]);
+  }, [messages.length, autoScroll]);
 
-  // 初始滚到底部（首次加载完消息后触发）
-  const initialScrollDone = useRef(false);
+  // 外部触发滚到底部（发送消息后）
   useEffect(() => {
-    if (!initialScrollDone.current && parentRef.current && messages.length > 0) {
-      parentRef.current.scrollTop = parentRef.current.scrollHeight;
-      initialScrollDone.current = true;
+    if (scrollTrigger && scrollTrigger > 0) {
+      setAutoScroll(true);
+      requestAnimationFrame(() => {
+        parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight, behavior: 'smooth' });
+      });
     }
-  }, [messages.length]);
+  }, [scrollTrigger]);
+
+  // Fallback: 消息在挂载后加载（首次页面加载时 store 为空）
+  // initialOffset 只在挂载时生效，消息后加载需要手动定位
+  const initialScrollDone = useRef(flatMessages.length > 0);
+  useLayoutEffect(() => {
+    if (!initialScrollDone.current && flatMessages.length > 0) {
+      initialScrollDone.current = true;
+      prevMessageCount.current = messages.length;
+      virtualizer.scrollToIndex(flatMessages.length - 1, { align: 'end' });
+      if (parentRef.current) {
+        parentRef.current.scrollTop = parentRef.current.scrollHeight;
+      }
+      setAutoScroll(true);
+    }
+  }, [flatMessages.length, virtualizer, messages.length]);
+
+  // Safety net: initialOffset relies on estimated sizes which may be inaccurate.
+  // After mount, verify we're actually at the bottom and correct if not.
+  useEffect(() => {
+    if (flatMessages.length === 0) return;
+    const raf1 = requestAnimationFrame(() => {
+      const el = parentRef.current;
+      if (!el) return;
+      const gap = el.scrollHeight - el.scrollTop - el.clientHeight;
+      if (gap > 100) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    return () => cancelAnimationFrame(raf1);
+    // Only on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-scroll when streaming content updates
+  const streaming = useChatStore(s => agentId ? s.agentStreaming[agentId] : s.streaming[groupJid ?? '']);
+  useEffect(() => {
+    if (autoScroll && streaming) {
+      parentRef.current?.scrollTo({ top: parentRef.current.scrollHeight });
+    }
+  }, [streaming, autoScroll]);
 
   const scrollToTop = useCallback(() => {
     parentRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
@@ -143,12 +204,12 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
   const showScrollButtons = messages.length > 0;
 
   return (
-    <div className="relative flex-1 overflow-hidden">
+    <div className="relative flex-1 overflow-hidden overflow-x-hidden">
       <div
         ref={parentRef}
-        className="h-full overflow-y-auto py-6 bg-background"
+        className="h-full overflow-y-auto overflow-x-hidden py-6 bg-background"
       >
-        <div className="max-w-3xl mx-auto px-4">
+        <div className="max-w-3xl mx-auto px-4 min-w-0">
         {loading && hasMore && (
           <div className="flex justify-center py-4">
             <Loader2 className="animate-spin text-primary" size={24} />
@@ -205,7 +266,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
                 >
                   <div className="flex items-center gap-3 my-6 px-4">
                     <div className="flex-1 border-t border-amber-300" />
-                    <span className="text-xs text-amber-600 whitespace-nowrap">
+                    <span className="text-xs text-amber-600 whitespace-pre-wrap">
                       {item.content}
                     </span>
                     <div className="flex-1 border-t border-amber-300" />
@@ -230,7 +291,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
                 >
                   <div className="flex items-center gap-3 my-6 px-4">
                     <div className="flex-1 border-t border-red-300" />
-                    <span className="text-xs text-red-600 whitespace-nowrap flex items-center gap-1">
+                    <span className="text-xs text-red-600 whitespace-pre-wrap flex items-center gap-1">
                       <AlertTriangle size={14} />
                       {item.content}
                     </span>
@@ -256,7 +317,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
                 ref={virtualizer.measureElement}
                 data-index={virtualItem.index}
               >
-                <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} />
+                <MessageBubble message={message} showTime={showTime} thinkingContent={thinkingCache[message.id]} isShared={isShared} />
               </div>
             );
           })}
@@ -266,6 +327,39 @@ export function MessageList({ messages, loading, hasMore, onLoadMore }: MessageL
           <div className="flex flex-col items-center justify-center h-full text-slate-400">
             <p className="text-sm">暂无消息</p>
             <p className="text-xs mt-2">发送消息开始对话</p>
+          </div>
+        )}
+
+        {groupJid && !agentId && (
+          <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} />
+        )}
+        {groupJid && agentId && (
+          <StreamingDisplay groupJid={groupJid} isWaiting={!!isWaiting} agentId={agentId} />
+        )}
+
+        {/* Agent status cards in main conversation (task agents only) */}
+        {!agentId && agents && agents.filter(a => a.kind === 'task').length > 0 && (
+          <div className="py-2">
+            {agents.filter(a => a.kind === 'task').map((agent) => (
+              <AgentStatusCard
+                key={agent.id}
+                agent={agent}
+                onClick={() => onAgentClick?.(agent.id)}
+              />
+            ))}
+          </div>
+        )}
+
+        {isWaiting && onInterrupt && (
+          <div className="flex justify-center py-1">
+            <button
+              type="button"
+              onClick={onInterrupt}
+              className="inline-flex items-center gap-1.5 px-3 py-1 text-xs text-slate-500 hover:text-red-600 bg-slate-100 hover:bg-red-50 rounded-full transition-colors cursor-pointer"
+            >
+              <Square className="w-3 h-3" />
+              中断
+            </button>
           </div>
         )}
         </div>

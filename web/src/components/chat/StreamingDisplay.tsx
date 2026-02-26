@@ -9,10 +9,13 @@ interface StreamingDisplayProps {
   groupJid: string;
   isWaiting: boolean;
   senderName?: string;
+  agentId?: string;
 }
 
-export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNameProp = 'AI' }: StreamingDisplayProps) {
-  const streaming = useChatStore(s => s.streaming[groupJid]);
+export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNameProp = 'AI', agentId }: StreamingDisplayProps) {
+  const mainStreaming = useChatStore(s => s.streaming[groupJid]);
+  const agentStreamingState = useChatStore(s => agentId ? s.agentStreaming[agentId] : undefined);
+  const streaming = agentId ? agentStreamingState : mainStreaming;
   const currentUser = useAuthStore(s => s.user);
   const appearance = useAuthStore(s => s.appearance);
   const senderName = currentUser?.ai_name || appearance?.aiName || senderNameProp;
@@ -218,10 +221,10 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
                           <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                         </svg>
                         {tool.toolName === 'Skill'
-                          ? `/${tool.skillName || 'unknown'}`
+                          ? (tool.skillName || 'unknown')
                           : tool.toolName}
                         {elapsed != null && (
-                          <span className="text-primary">{elapsed.toFixed(1)}s</span>
+                          <span className="text-primary">{Math.round(elapsed)}s</span>
                         )}
                       </span>
                       {tool.toolInputSummary && (
@@ -262,12 +265,13 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
 
             {/* Partial text with Markdown rendering */}
             {streaming.partialText && (
-              <div className="prose prose-sm max-w-none prose-headings:text-slate-900 prose-p:text-slate-800 prose-p:leading-relaxed overflow-hidden">
+              <div className="max-w-none overflow-hidden">
                 <MarkdownRenderer
                   content={streaming.partialText.length > 5000
                     ? '...' + streaming.partialText.slice(-4000)
                     : streaming.partialText}
                   groupJid={groupJid}
+                  variant="chat"
                 />
               </div>
             )}

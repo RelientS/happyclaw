@@ -44,6 +44,77 @@ export interface RegisteredGroup {
   initGitUrl?: string; // 容器模式下 clone 来源的 Git URL
   created_by?: string;
   is_home?: boolean; // 用户主容器标记
+  selected_skills?: string[] | null; // null = 全部启用
+  workspace_id?: number; // 绑定到共享工作区（如果存在）
+  is_shared_workspace?: boolean; // 标记该 group 是否为共享工作区的入口
+}
+
+export interface GroupMember {
+  user_id: string;
+  role: 'owner' | 'member';
+  added_at: string;
+  added_by?: string;
+  username: string;
+  display_name: string;
+}
+
+// --- Shared Workspace types ---
+
+export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
+export type TaskType = 'quick' | 'simple' | 'complex' | 'background';
+export type WorkspaceTaskStatus = 'queued' | 'running' | 'completed' | 'failed';
+
+export interface Workspace {
+  id: number;
+  folder: string; // workspace-{uuid}
+  name: string;
+  owner_user_id: string;
+  execution_mode: ExecutionMode;
+  max_parallel_tasks: number;
+  created_at: string;
+}
+
+export interface WorkspaceMember {
+  id: number;
+  workspace_id: number;
+  user_id: string;
+  role: WorkspaceRole;
+  joined_at: string;
+  // 扩展字段（从 users 表 JOIN）
+  username?: string;
+  display_name?: string;
+}
+
+export interface WorkspaceTask {
+  id: number;
+  workspace_id: number;
+  requested_by_user_id: string;
+  message: string;
+  task_type: TaskType;
+  status: WorkspaceTaskStatus;
+  priority: number;
+  queue_position: number | null;
+  started_at: string | null;
+  completed_at: string | null;
+  result: string | null; // JSON 字符串
+  // 扩展字段
+  requested_by_username?: string;
+  estimated_wait_ms?: number;
+}
+
+export interface WorkspaceInvite {
+  id: number;
+  workspace_id: number;
+  code: string;
+  created_by_user_id: string;
+  expires_at: string;
+  max_uses: number;
+  use_count: number;
+  used_at: string | null;
+  used_by_user_id: string | null;
+  // 扩展字段
+  creator_username?: string;
+  used_by_username?: string;
 }
 
 export interface NewMessage {
@@ -229,15 +300,35 @@ export interface AuthAuditLog {
   created_at: string;
 }
 
+// --- Sub-Agent types ---
+
+export type AgentStatus = 'idle' | 'running' | 'completed' | 'error';
+export type AgentKind = 'task' | 'conversation';
+
+export interface SubAgent {
+  id: string;
+  group_folder: string;
+  chat_jid: string;
+  name: string;
+  prompt: string;
+  status: AgentStatus;
+  kind: AgentKind;
+  created_by: string | null;
+  created_at: string;
+  completed_at: string | null;
+  result_summary: string | null;
+}
+
 // WebSocket message types
 export type WsMessageOut =
   | {
       type: 'new_message';
       chatJid: string;
       message: NewMessage & { is_from_me: boolean };
+      agentId?: string;
     }
-  | { type: 'agent_reply'; chatJid: string; text: string; timestamp: string }
-  | { type: 'typing'; chatJid: string; isTyping: boolean }
+  | { type: 'agent_reply'; chatJid: string; text: string; timestamp: string; agentId?: string }
+  | { type: 'typing'; chatJid: string; isTyping: boolean; agentId?: string }
   | {
       type: 'status_update';
       activeContainers: number;
@@ -245,14 +336,30 @@ export type WsMessageOut =
       activeTotal: number;
       queueLength: number;
     }
-  | { type: 'stream_event'; chatJid: string; event: StreamEvent }
+  | { type: 'stream_event'; chatJid: string; event: StreamEvent; agentId?: string }
+  | {
+      type: 'agent_status';
+      chatJid: string;
+      agentId: string;
+      status: AgentStatus;
+      kind?: AgentKind;
+      name: string;
+      prompt: string;
+      resultSummary?: string;
+    }
   | { type: 'terminal_output'; chatJid: string; data: string }
   | { type: 'terminal_started'; chatJid: string }
   | { type: 'terminal_stopped'; chatJid: string; reason?: string }
-  | { type: 'terminal_error'; chatJid: string; error: string };
+  | { type: 'terminal_error'; chatJid: string; error: string }
+  // Workspace events
+  | { type: 'workspace.task.created'; workspaceId: number; task: WorkspaceTask }
+  | { type: 'workspace.task.started'; workspaceId: number; task: WorkspaceTask }
+  | { type: 'workspace.task.progress'; workspaceId: number; event: any } // TODO: refine event type when container integration is done
+  | { type: 'workspace.task.completed'; workspaceId: number; task: WorkspaceTask }
+  | { type: 'workspace.queue.updated'; workspaceId: number; queue: WorkspaceTask[] };
 
 export type WsMessageIn =
-  | { type: 'send_message'; chatJid: string; content: string; attachments?: MessageAttachment[] }
+  | { type: 'send_message'; chatJid: string; content: string; attachments?: MessageAttachment[]; agentId?: string }
   | { type: 'terminal_start'; chatJid: string; cols: number; rows: number }
   | { type: 'terminal_input'; chatJid: string; data: string }
   | { type: 'terminal_resize'; chatJid: string; cols: number; rows: number }

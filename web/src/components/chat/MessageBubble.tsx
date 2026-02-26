@@ -9,6 +9,7 @@ interface MessageBubbleProps {
   message: Message;
   showTime: boolean;
   thinkingContent?: string;
+  isShared?: boolean;
 }
 
 interface MessageAttachment {
@@ -65,12 +66,13 @@ function ReasoningBlock({ content }: { content: string }) {
   );
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, showTime, thinkingContent }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({ message, showTime, thinkingContent, isShared }: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
   const currentUser = useAuthStore((s) => s.user);
   const appearance = useAuthStore((s) => s.appearance);
   const isUser = !message.is_from_me;
+  const isOtherUser = isShared && isUser && message.sender !== currentUser?.id;
   const time = new Date(message.timestamp)
     .toLocaleString('zh-CN', {
       year: 'numeric',
@@ -141,10 +143,75 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   }
 
   if (isUser) {
-    // User message: solid colored pill, right-aligned
+    // Shared workspace — other user's message: left-aligned with avatar
+    if (isOtherUser) {
+      const otherName = message.sender_name || '用户';
+      const initial = otherName[0]?.toUpperCase() || '?';
+      return (
+        <div className="group mb-4">
+          <div className="flex items-center gap-2 mb-1.5 lg:hidden">
+            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center text-xs font-medium text-slate-600 flex-shrink-0">
+              {initial}
+            </div>
+            <span className="text-xs text-muted-foreground font-medium">{otherName}</span>
+            {showTime && <span className="text-xs text-muted-foreground">{time}</span>}
+          </div>
+
+          <div className="lg:flex lg:gap-3">
+            <div className="hidden lg:block flex-shrink-0">
+              <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-sm font-medium text-slate-600">
+                {initial}
+              </div>
+            </div>
+            <div className="flex-1 min-w-0 max-w-[85%] lg:max-w-[75%]">
+              <div className="hidden lg:flex items-center gap-2 mb-1">
+                <span className="text-xs text-muted-foreground font-medium">{otherName}</span>
+                {showTime && <span className="text-xs text-muted-foreground">{time}</span>}
+              </div>
+              <div className="relative">
+                {images.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mb-2">
+                    {images.map((img, i) => (
+                      <img
+                        key={i}
+                        src={`data:${img.mimeType || 'image/png'};base64,${img.data}`}
+                        alt={img.name || `图片 ${i + 1}`}
+                        className="max-w-48 max-h-48 rounded-lg object-cover cursor-pointer border-2 border-primary hover:border-primary transition-colors"
+                        onClick={() => setExpandedImage(`data:${img.mimeType || 'image/png'};base64,${img.data}`)}
+                      />
+                    ))}
+                  </div>
+                )}
+                <div className="bg-white border border-slate-200 text-foreground px-4 py-2.5 rounded-2xl rounded-tl-sm shadow-sm">
+                  <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">{message.content}</p>
+                </div>
+                <button
+                  onClick={handleCopy}
+                  className="absolute -right-8 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 opacity-60 lg:opacity-0 lg:group-hover:opacity-100 transition-opacity cursor-pointer"
+                  title="复制"
+                  aria-label="复制消息"
+                >
+                  {copied ? <Check className="w-3.5 h-3.5 text-primary" /> : <Copy className="w-3.5 h-3.5" />}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {expandedImage && <ImageLightbox src={expandedImage} onClose={() => setExpandedImage(null)} />}
+        </div>
+      );
+    }
+
+    // User message (own): right-aligned
+    const showSenderLabel = isShared;
     return (
       <div className="group flex justify-end mb-4">
         <div className="flex flex-col items-end max-w-[85%] lg:max-w-[75%] min-w-0">
+          {showSenderLabel && (
+            <span className="text-xs text-muted-foreground font-medium mb-1 mr-1">
+              {message.sender_name || currentUser?.display_name || currentUser?.username || '我'}
+            </span>
+          )}
           <div className="relative">
             {/* Image attachments */}
             {images.length > 0 && (
@@ -239,8 +306,8 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             )}
 
             {/* Content */}
-            <div className="prose prose-sm max-w-none prose-headings:text-slate-900 prose-p:text-slate-800 prose-p:leading-relaxed overflow-hidden">
-              <MarkdownRenderer content={message.content} groupJid={message.chat_jid} />
+            <div className="max-w-none overflow-hidden">
+              <MarkdownRenderer content={message.content} groupJid={message.chat_jid} variant="chat" />
             </div>
           </div>
         </div>
@@ -253,5 +320,6 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
   prev.message.id === next.message.id &&
   prev.message.content === next.message.content &&
   prev.showTime === next.showTime &&
-  prev.thinkingContent === next.thinkingContent
+  prev.thinkingContent === next.thinkingContent &&
+  prev.isShared === next.isShared
 );

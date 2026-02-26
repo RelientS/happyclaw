@@ -45,6 +45,8 @@ import fileRoutes from './routes/files.js';
 import monitorRoutes from './routes/monitor.js';
 import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
+import agentRoutes from './routes/agents.js';
+import workspaceRoutes from './routes/workspaces.js';
 
 // Database and types (only for handleWebUserMessage and broadcast)
 import {
@@ -55,11 +57,16 @@ import {
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
+  getGroupMembers,
+  getAgent,
+  isGroupShared,
+  getWorkspaceMembers,
 } from './db.js';
 import { isSessionExpired } from './auth.js';
 import type { NewMessage, WsMessageOut, WsMessageIn, AuthUser, StreamEvent, UserRole } from './types.js';
 import { WEB_PORT, SESSION_COOKIE_NAME } from './config.js';
 import { logger } from './logger.js';
+import { workspaceManager } from './workspace-queue.js';
 
 // --- App Setup ---
 
@@ -131,6 +138,8 @@ app.route('/api/tasks', tasksRoutes);
 app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
+app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
+app.route('/api/workspaces', workspaceRoutes); // Shared workspace routes
 app.route('/api', monitorRoutes);
 
 // --- POST /api/messages ---
@@ -226,6 +235,7 @@ async function handleWebUserMessage(
     attachments: attachmentsStr,
   });
 
+  const shared = !group.is_home && isGroupShared(group.folder);
   const formatted = deps.formatMessages([
     {
       id: messageId,
@@ -235,7 +245,7 @@ async function handleWebUserMessage(
       content,
       timestamp,
     },
-  ]);
+  ], shared);
 
   // For home chat, avoid piping into an active Feishu-driven run.
   // Force a new processing pass so reply channel can be decided correctly.
@@ -262,6 +272,72 @@ async function handleWebUserMessage(
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
   return { ok: true, messageId, timestamp };
+}
+
+// --- Agent Conversation Message Handler ---
+
+async function handleAgentConversationMessage(
+  chatJid: string,
+  agentId: string,
+  content: string,
+  userId: string,
+  displayName: string,
+  attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
+): Promise<void> {
+  if (!deps) return;
+
+  const agent = getAgent(agentId);
+  if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
+    logger.warn({ chatJid, agentId }, 'Agent conversation message rejected: agent not found or not a conversation');
+    return;
+  }
+
+  const virtualChatJid = `${chatJid}#agent:${agentId}`;
+
+  // Store message with virtual chat_jid
+  const messageId = crypto.randomUUID();
+  const timestamp = new Date().toISOString();
+  const attachmentsStr = attachments && attachments.length > 0 ? JSON.stringify(attachments) : undefined;
+
+  ensureChatExists(virtualChatJid);
+  storeMessageDirect(
+    messageId, virtualChatJid, userId, displayName, content, timestamp, false, attachmentsStr,
+  );
+
+  // Broadcast new_message with agentId so frontend routes to agent tab
+  broadcastNewMessage(virtualChatJid, {
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: displayName,
+    content,
+    timestamp,
+    is_from_me: false,
+    attachments: attachmentsStr,
+  }, agentId);
+
+  // Format for agent
+  const shared = false; // agent conversations are not shared
+  const formatted = deps.formatMessages([{
+    id: messageId,
+    chat_jid: virtualChatJid,
+    sender: userId,
+    sender_name: displayName,
+    content,
+    timestamp,
+  }], shared);
+
+  // Try to pipe into running agent process
+  const sent = deps.queue.sendMessage(virtualChatJid, formatted);
+  if (!sent) {
+    // No running process — start one via processAgentConversation
+    if (deps.processAgentConversation) {
+      const taskId = `agent-conv:${agentId}:${Date.now()}`;
+      deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
+        await deps!.processAgentConversation!(chatJid, agentId);
+      });
+    }
+  }
 }
 
 // --- Static Files ---
@@ -398,6 +474,7 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
           const { chatJid, content, attachments } = wsValidation.data;
+          const agentId = (msg as { agentId?: string }).agentId;
 
           // 群组访问权限检查
           const targetGroup = getRegisteredGroup(chatJid);
@@ -418,6 +495,16 @@ function setupWebSocket(server: any): WebSocketServer {
                 return;
               }
             }
+          }
+
+          // Route to agent conversation handler if agentId is present
+          if (agentId && deps) {
+            await handleAgentConversationMessage(
+              chatJid, agentId, content.trim(),
+              session.user_id, session.display_name || session.username,
+              attachments,
+            );
+            return;
           }
 
           const result = await handleWebUserMessage(chatJid, content.trim(), attachments, session.user_id, session.display_name || session.username);
@@ -620,12 +707,12 @@ function setupWebSocket(server: any): WebSocketServer {
  *
  * @param msg - The message to broadcast
  * @param adminOnly - If true, only admin users receive the message
- * @param ownerUserId - Group owner filtering:
+ * @param allowedUserIds - Group access filtering:
  *   - undefined: no user-level filtering (e.g. system-wide admin broadcasts)
  *   - null: ownership unresolvable → default-deny, only admin can see
- *   - string: only this owner + admin can see
+ *   - Set<string>: only these users + admin can see
  */
-function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: string | null): void {
+function safeBroadcast(msg: WsMessageOut, adminOnly = false, allowedUserIds?: Set<string> | null): void {
   const data = JSON.stringify(msg);
   for (const [client, clientInfo] of wsClients) {
     if (client.readyState !== WebSocket.OPEN) {
@@ -668,10 +755,10 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: strin
       continue;
     }
 
-    // Group isolation: only owner and admins can see this group's events
-    // ownerUserId === null means ownership unresolvable → default-deny (admin-only)
-    if (ownerUserId !== undefined && session.role !== 'admin') {
-      if (ownerUserId === null || session.user_id !== ownerUserId) {
+    // Group isolation: only allowed users and admins can see this group's events
+    // allowedUserIds === null means ownership unresolvable → default-deny (admin-only)
+    if (allowedUserIds !== undefined && session.role !== 'admin') {
+      if (allowedUserIds === null || !allowedUserIds.has(session.user_id)) {
         continue;
       }
     }
@@ -685,37 +772,79 @@ function safeBroadcast(msg: WsMessageOut, adminOnly = false, ownerUserId?: strin
 }
 
 /**
- * Get the owner userId for broadcast filtering.
- * For any group with created_by, return that owner.
- * For legacy IM groups missing created_by, try resolving owner from sibling home group.
+ * Get the set of user IDs allowed to receive broadcasts for a group.
+ * Includes the owner, all shared members, and always admins (handled in safeBroadcast).
  *
  * Returns:
- * - string: resolved owner userId → only owner + admin can see
+ * - Set<string>: allowed user IDs (owner + shared members)
  * - null: ownership unresolvable → default-deny (admin-only)
- * - undefined is NOT returned; callers receive string | null
  */
-function getGroupOwnerUserId(chatJid: string): string | null {
+const allowedUserIdsCache = new Map<string, { ids: Set<string> | null; expiry: number }>();
+const ALLOWED_CACHE_TTL = 10_000; // 10 seconds
+
+function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
+  const now = Date.now();
+  const cached = allowedUserIdsCache.get(chatJid);
+  if (cached && cached.expiry > now) return cached.ids;
+
+  const result = computeGroupAllowedUserIds(chatJid);
+  allowedUserIdsCache.set(chatJid, { ids: result, expiry: now + ALLOWED_CACHE_TTL });
+  return result;
+}
+
+/** Invalidate the allowed-user cache for a group and all sibling JIDs sharing the same folder. */
+export function invalidateAllowedUserCache(chatJid: string): void {
+  allowedUserIdsCache.delete(chatJid);
+  // Also clear cache for sibling JIDs sharing the same folder,
+  // since membership is per-folder, not per-JID.
+  const group = getRegisteredGroup(chatJid);
+  if (group) {
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      allowedUserIdsCache.delete(jid);
+    }
+  }
+}
+
+function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
   const group = getRegisteredGroup(chatJid);
   if (!group) return null; // Unknown group → deny by default
 
-  if (group.created_by) return group.created_by;
+  const allowed = new Set<string>();
+
+  // Add owner
+  let ownerId: string | null = group.created_by ?? null;
 
   // Legacy fallback: IM group without created_by, resolve by sibling home group.
-  if (!chatJid.startsWith('web:')) {
+  if (!ownerId && !chatJid.startsWith('web:')) {
     const siblingJids = getJidsByFolder(group.folder);
     for (const siblingJid of siblingJids) {
       if (!siblingJid.startsWith('web:')) continue;
       const siblingGroup = getRegisteredGroup(siblingJid);
       if (siblingGroup?.is_home && siblingGroup.created_by) {
-        return siblingGroup.created_by;
+        ownerId = siblingGroup.created_by;
+        break;
       }
     }
-    return null; // Unresolvable legacy IM group → deny by default
   }
 
-  if (group.is_home) return group.created_by ?? null;
-  if (group.folder === 'main') return null; // admin's host group, adminOnly handles it
-  return group.created_by ?? null; // Legacy web group without owner → deny by default
+  if (!ownerId) {
+    if (group.is_home) return null;
+    if (group.folder === 'main') return null;
+    return null; // Unresolvable → deny by default
+  }
+
+  allowed.add(ownerId);
+
+  // For non-home groups, include shared members
+  if (!group.is_home) {
+    const members = getGroupMembers(group.folder);
+    for (const m of members) {
+      allowed.add(m.user_id);
+    }
+  }
+
+  return allowed;
 }
 
 /** Check if a chatJid belongs to a host-mode group (for broadcast filtering) */
@@ -747,45 +876,78 @@ function normalizeHomeJid(chatJid: string): string {
 export function broadcastToWebClients(chatJid: string, text: string): void {
   const timestamp = new Date().toISOString();
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   safeBroadcast(
     { type: 'agent_reply', chatJid: jid, text, timestamp },
     isHostGroupJid(chatJid),
-    ownerUserId,
+    allowedUserIds,
   );
 }
 
 export function broadcastNewMessage(
   chatJid: string,
   msg: NewMessage & { is_from_me?: boolean },
+  agentId?: string,
 ): void {
-  const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
-  safeBroadcast(
-    {
-      type: 'new_message',
-      chatJid: jid,
-      message: { ...msg, is_from_me: msg.is_from_me ?? false },
-    },
-    isHostGroupJid(chatJid),
-    ownerUserId,
-  );
+  // For virtual JIDs like "web:xxx#agent:yyy", extract base JID for broadcast
+  const baseChatJid = chatJid.includes('#agent:') ? chatJid.split('#agent:')[0] : chatJid;
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const wsMsg: WsMessageOut = {
+    type: 'new_message',
+    chatJid: jid,
+    message: { ...msg, is_from_me: msg.is_from_me ?? false },
+    ...(agentId ? { agentId } : {}),
+  };
+  safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
 
 export function broadcastTyping(chatJid: string, isTyping: boolean): void {
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
   safeBroadcast(
     { type: 'typing', chatJid: jid, isTyping },
     isHostGroupJid(chatJid),
-    ownerUserId,
+    allowedUserIds,
   );
 }
 
-export function broadcastStreamEvent(chatJid: string, event: StreamEvent): void {
+export function broadcastStreamEvent(chatJid: string, event: StreamEvent, agentId?: string): void {
   const jid = normalizeHomeJid(chatJid);
-  const ownerUserId = getGroupOwnerUserId(chatJid);
-  safeBroadcast({ type: 'stream_event', chatJid: jid, event }, isHostGroupJid(chatJid), ownerUserId);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  const msg: WsMessageOut = agentId
+    ? { type: 'stream_event', chatJid: jid, event, agentId }
+    : { type: 'stream_event', chatJid: jid, event };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastAgentStatus(
+  chatJid: string,
+  agentId: string,
+  status: import('./types.js').AgentStatus,
+  name: string,
+  prompt: string,
+  resultSummary?: string,
+  kind?: import('./types.js').AgentKind,
+): void {
+  const jid = normalizeHomeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  // Resolve kind from DB if not provided
+  const resolvedKind = kind || getAgent(agentId)?.kind;
+  const msg: WsMessageOut = { type: 'agent_status', chatJid: jid, agentId, status, kind: resolvedKind, name, prompt, resultSummary };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+/**
+ * Broadcast workspace events to all workspace members.
+ * Filters broadcasts to only users who are members of the workspace.
+ */
+export function broadcastToWorkspace(workspaceId: number, event: WsMessageOut): void {
+  const members = getWorkspaceMembers(workspaceId);
+  const allowedUserIds = new Set(members.map((m) => m.user_id));
+
+  // Workspace events are never host-only (always container mode)
+  safeBroadcast(event, false, allowedUserIds);
 }
 
 function broadcastStatus(): void {
@@ -840,6 +1002,47 @@ export function startWebServer(webDeps: WebDeps): void {
         }
       }
     }
+  });
+
+  // Register workspace event listeners
+  workspaceManager.on('workspace.task.created', ({ workspaceId, task }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.created' as any,
+      workspaceId,
+      task,
+    });
+  });
+
+  workspaceManager.on('workspace.task.started', ({ workspaceId, task }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.started' as any,
+      workspaceId,
+      task,
+    });
+  });
+
+  workspaceManager.on('workspace.task.progress', ({ workspaceId, event }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.progress' as any,
+      workspaceId,
+      event,
+    });
+  });
+
+  workspaceManager.on('workspace.task.completed', ({ workspaceId, task }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.task.completed' as any,
+      workspaceId,
+      task,
+    });
+  });
+
+  workspaceManager.on('workspace.queue.updated', ({ workspaceId, queue }) => {
+    broadcastToWorkspace(workspaceId, {
+      type: 'workspace.queue.updated' as any,
+      workspaceId,
+      queue,
+    });
   });
 
   // Broadcast status every 5 seconds
