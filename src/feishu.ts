@@ -1190,15 +1190,14 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
 
       try {
         // Step 1: Upload image to Feishu to get image_key
-        const uploadResult = await client.im.image.create({
+        const uploadResult = await client.im.v1.image.create({
           data: {
             image_type: 'message',
             image: imageBuffer,
           },
-        });
+        }) as { data?: { image_key?: string } } | null;
 
-        // SDK 不同版本返回结构不同：新版直接返回 image_key，旧版包在 data 里
-        const imageKey = uploadResult?.image_key ?? (uploadResult as any)?.data?.image_key;
+        const imageKey = uploadResult?.data?.image_key;
         if (!imageKey) {
           logger.error({ chatId }, 'Feishu image upload failed: no image_key returned');
           throw new Error('Feishu image upload failed: no image_key in response');
@@ -1241,6 +1240,7 @@ export function createFeishuConnection(config: FeishuConnectionConfig): FeishuCo
         logger.info({ chatId, imageKey, mimeType, size: imageBuffer.length }, 'Feishu image sent');
       } catch (err) {
         logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
+        throw err;
       }
     },
 

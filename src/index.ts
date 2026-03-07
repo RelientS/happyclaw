@@ -1808,6 +1808,33 @@ function startIpcWatcher(): void {
                     // Send to IM channel (caption is included in the image message itself)
                     await imManager.sendImage(data.chatJid, imageBuffer, mimeType, caption, fileName);
 
+                    // Persist image message to DB and broadcast to WebSocket (same as sendMessage flow)
+                    const displayText = caption
+                      ? `[图片: ${fileName || 'image'}]\n${caption}`
+                      : `[图片: ${fileName || 'image'}]`;
+                    const imgMsgId = crypto.randomUUID();
+                    const imgTimestamp = new Date().toISOString();
+                    ensureChatExists(data.chatJid);
+                    storeMessageDirect(
+                      imgMsgId,
+                      data.chatJid,
+                      'happyclaw-agent',
+                      ASSISTANT_NAME,
+                      displayText,
+                      imgTimestamp,
+                      true,
+                    );
+                    broadcastNewMessage(data.chatJid, {
+                      id: imgMsgId,
+                      chat_jid: data.chatJid,
+                      sender: 'happyclaw-agent',
+                      sender_name: ASSISTANT_NAME,
+                      content: displayText,
+                      timestamp: imgTimestamp,
+                      is_from_me: true,
+                    });
+                    broadcastToWebClients(data.chatJid, displayText);
+
                     logger.info(
                       { chatJid: data.chatJid, sourceGroup, mimeType, size: imageBuffer.length },
                       'IPC image sent',
