@@ -168,6 +168,7 @@ export const ClaudeThirdPartyProfileSecretsSchema = z
 export const GroupPatchSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN).optional(),
   selected_skills: z.array(z.string().max(128).regex(/^[\w\-]+$/, 'Skill ID must be alphanumeric with hyphens/underscores')).max(200).nullable().optional(),
+  is_pinned: z.boolean().optional(),
 });
 
 export const LoginSchema = z.object({

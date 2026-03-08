@@ -16,6 +16,7 @@ export interface GroupInfo {
   custom_cwd?: string;
   created_by?: string;
   selected_skills?: string[] | null;
+  pinned_at?: string;
 }
 
 export interface AgentInfo {

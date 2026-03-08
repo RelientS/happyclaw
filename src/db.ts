@@ -251,6 +251,16 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
   `);
 
+  // User pinned groups (per-user workspace pinning)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_pinned_groups (
+      user_id TEXT NOT NULL,
+      jid TEXT NOT NULL,
+      pinned_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, jid)
+    );
+  `);
+
   // Sub-agents table for multi-agent parallel execution
   db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
@@ -1440,8 +1450,35 @@ export function deleteGroupData(jid: string, folder: string): void {
     // 5. 删除聊天记录
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
+    // 6. 删除 pin 记录
+    db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
   });
   tx();
+}
+
+// --- User pinned groups ---
+
+export function getUserPinnedGroups(userId: string): Record<string, string> {
+  const rows = db
+    .prepare('SELECT jid, pinned_at FROM user_pinned_groups WHERE user_id = ?')
+    .all(userId) as Array<{ jid: string; pinned_at: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) result[row.jid] = row.pinned_at;
+  return result;
+}
+
+export function pinGroup(userId: string, jid: string): string {
+  const pinned_at = new Date().toISOString();
+  db.prepare(
+    'INSERT OR REPLACE INTO user_pinned_groups (user_id, jid, pinned_at) VALUES (?, ?, ?)',
+  ).run(userId, jid, pinned_at);
+  return pinned_at;
+}
+
+export function unpinGroup(userId: string, jid: string): void {
+  db.prepare(
+    'DELETE FROM user_pinned_groups WHERE user_id = ? AND jid = ?',
+  ).run(userId, jid);
 }
 
 // --- Web API accessors ---
