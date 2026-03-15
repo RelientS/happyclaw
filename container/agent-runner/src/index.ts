@@ -898,12 +898,12 @@ async function runQuery(
   const systemPromptAppend = [
     globalClaudeMd,
     heartbeatContent,
-    conversationAgentGuidelines,
     interactionGuidelines,
     memoryRecall,
     outputGuidelines,
     webFetchGuidelines,
     backgroundTaskGuidelines,
+    conversationAgentGuidelines,
   ].filter(Boolean).join('\n');
 
   // Home containers (admin & member) can access global and memory directories.

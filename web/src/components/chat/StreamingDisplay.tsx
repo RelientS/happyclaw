@@ -265,23 +265,16 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
       const threshold = hasData ? STALE_WITH_DATA_MS : STALE_NO_DATA_MS;
 
       if (elapsed > threshold) {
-        // Clear the stuck waiting state
+        // Clear the stuck waiting state via clearStreaming (handles pendingThinking + SDK Task preservation)
+        useChatStore.getState().clearStreaming(groupJid);
         if (agentId) {
+          // clearStreaming doesn't handle agent-specific state, clean it separately
           useChatStore.setState(s => {
             const nextStreaming = { ...s.agentStreaming };
             delete nextStreaming[agentId];
             return {
               agentWaiting: { ...s.agentWaiting, [agentId]: false },
               agentStreaming: nextStreaming,
-            };
-          });
-        } else {
-          useChatStore.setState(s => {
-            const nextStreaming = { ...s.streaming };
-            delete nextStreaming[groupJid];
-            return {
-              waiting: { ...s.waiting, [groupJid]: false },
-              streaming: nextStreaming,
             };
           });
         }
