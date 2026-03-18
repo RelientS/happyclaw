@@ -277,6 +277,10 @@ function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
 }
 
+function generateTurnId(): string {
+  return `ipc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 /**
  * Normalize isMain/isHome/isAdminHome flags for backward compatibility.
  * If the host sends the old `isMain` field, treat it as isHome=true + isAdminHome=true.
@@ -1434,6 +1438,7 @@ async function main(): Promise<void> {
         clearInterruptRequested();
         prompt = nextMessage.text;
         promptImages = nextMessage.images;
+        containerInput.turnId = generateTurnId();
         continue;
       }
 
@@ -1489,6 +1494,7 @@ async function main(): Promise<void> {
       log(`Got new message (${nextMessage.text.length} chars, ${nextMessage.images?.length || 0} images), starting new query`);
       prompt = nextMessage.text;
       promptImages = nextMessage.images;
+      containerInput.turnId = generateTurnId();
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
