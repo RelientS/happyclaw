@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { ArrowLeft, BookOpen, Loader2, RefreshCw, Save } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../api/client';
@@ -59,6 +60,9 @@ function scopeLabel(scope: MemorySource['scope']): string {
 }
 
 export function MemoryPage() {
+  const [searchParams] = useSearchParams();
+  const folderParam = searchParams.get('folder');
+
   const [sources, setSources] = useState<MemorySource[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [content, setContent] = useState('');
@@ -125,6 +129,16 @@ export function MemoryPage() {
       let nextSelected = selectedPath && available.has(selectedPath) ? selectedPath : null;
 
       if (!nextSelected) {
+        // If folder param provided, try to find matching flow CLAUDE.md first
+        if (folderParam) {
+          nextSelected =
+            data.sources.find(
+              (s) => s.scope === 'flow' && s.kind === 'claude' && s.path.includes(`/${folderParam}/`),
+            )?.path || null;
+        }
+      }
+
+      if (!nextSelected) {
         // Default: first user-global CLAUDE.md, then main, then first available
         nextSelected =
           data.sources.find((s) => s.scope === 'user-global' && s.kind === 'claude')?.path ||
@@ -146,7 +160,7 @@ export function MemoryPage() {
     } finally {
       setLoadingSources(false);
     }
-  }, [loadFile, selectedPath]);
+  }, [loadFile, selectedPath, folderParam]);
 
   useEffect(() => {
     loadSources();
