@@ -4426,8 +4426,8 @@ async function processTaskIpc(
             break;
           }
         } else if (scheduleType === 'interval') {
-          const ms = parseInt(data.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
+          const ms = Number(data.schedule_value);
+          if (!Number.isFinite(ms) || ms <= 0) {
             logger.warn(
               { scheduleValue: data.schedule_value },
               'Invalid interval',
@@ -4447,15 +4447,17 @@ async function processTaskIpc(
           nextRun = scheduled.toISOString();
         }
 
-        const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const taskId = crypto.randomUUID();
         const contextMode =
           data.context_mode === 'group' || data.context_mode === 'isolated'
             ? data.context_mode
             : 'isolated';
         const executionMode =
-          data.execution_mode === 'host' || data.execution_mode === 'container'
-            ? data.execution_mode
-            : null;
+          data.execution_mode === 'host' && isAdminHome
+            ? 'host'
+            : data.execution_mode === 'container'
+              ? 'container'
+              : null;
         createTask({
           id: taskId,
           group_folder: targetFolder,
@@ -7499,12 +7501,12 @@ async function main(): Promise<void> {
     if (!owner || owner.role === 'admin') return { allowed: true };
     const limit = getUserConcurrentContainerLimit(owner.id, owner.role);
     if (limit == null) return { allowed: true };
-    // Count active containers for this user
+    // Count active containers for this user (including task virtual JIDs)
     let userActive = 0;
     for (const [jid, g] of Object.entries(registeredGroups)) {
-      if (g.created_by === owner.id && queue.hasDirectActiveRunner(jid)) {
-        userActive++;
-      }
+      if (g.created_by !== owner.id) continue;
+      if (queue.hasDirectActiveRunner(jid)) userActive++;
+      userActive += queue.countActiveTaskRunners(jid);
     }
     return { allowed: userActive < limit };
   });

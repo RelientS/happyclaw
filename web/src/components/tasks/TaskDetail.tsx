@@ -11,6 +11,7 @@ const CHANNEL_LABELS: Record<string, string> = {
   telegram: 'Telegram',
   qq: 'QQ',
   wechat: '微信',
+  dingtalk: '钉钉',
 };
 
 interface TaskDetailProps {

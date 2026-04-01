@@ -23,6 +23,7 @@ import {
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
+  deleteGroupData,
   ensureChatExists,
   getDueTasks,
   getTaskById,
@@ -38,6 +39,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
+import { removeFlowArtifacts } from './file-manager.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
 import { ExecutionMode, RegisteredGroup, ScheduledTask } from './types.js';
@@ -199,15 +201,15 @@ function computeNextRun(task: ScheduledTask): string | null {
     });
     return interval.next().toISOString();
   } else if (task.schedule_type === 'interval') {
-    const ms = parseInt(task.schedule_value, 10);
+    const ms = Number(task.schedule_value);
+    if (!Number.isFinite(ms) || ms <= 0) return null;
     const anchor = task.next_run
       ? new Date(task.next_run).getTime()
       : Date.now();
-    let nextTime = anchor + ms;
-    while (nextTime <= Date.now()) {
-      nextTime += ms;
-    }
-    return new Date(nextTime).toISOString();
+    const now = Date.now();
+    const elapsed = now - anchor;
+    const periods = elapsed > 0 ? Math.ceil(elapsed / ms) : 1;
+    return new Date(anchor + periods * ms).toISOString();
   }
   // 'once' tasks have no next run
   return null;
@@ -230,11 +232,15 @@ function isTaskStillActive(taskId: string, label?: string): boolean {
 }
 
 async function runTask(
-  task: ScheduledTask,
+  staleTask: ScheduledTask,
   deps: SchedulerDependencies,
   options?: RunTaskOptions,
 ): Promise<void> {
-  if (!options?.manualRun && !isTaskStillActive(task.id, 'task')) return;
+  if (!options?.manualRun && !isTaskStillActive(staleTask.id, 'task')) return;
+
+  // Refresh task from DB to avoid stale closure data
+  const task = getTaskById(staleTask.id);
+  if (!task) return;
 
   runningTaskIds.add(task.id);
   const startTime = Date.now();
@@ -295,8 +301,8 @@ async function runTask(
           error: `计费限制: ${reason}`,
         });
         runningTaskIds.delete(task.id);
-        // Still compute next run so the task isn't stuck
-        const nextRun = computeNextRun(task);
+        // Still compute next run so the task isn't stuck (but preserve for manual runs)
+        const nextRun = options?.manualRun ? task.next_run : computeNextRun(task);
         updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
         return;
       }
@@ -480,15 +486,36 @@ async function runTask(
       ? result.slice(0, 200)
       : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  // Auto-cleanup once-task workspace after completion
+  if (task.schedule_type === 'once' && !options?.manualRun && task.workspace_jid && task.workspace_folder) {
+    setTimeout(() => {
+      try {
+        const groups = deps.registeredGroups();
+        if (groups[task.workspace_jid!]) {
+          deleteGroupData(task.workspace_jid!, task.workspace_folder!);
+          delete groups[task.workspace_jid!];
+          removeFlowArtifacts(task.workspace_folder!);
+          logger.info({ taskId: task.id, folder: task.workspace_folder }, 'Cleaned up once-task workspace');
+        }
+      } catch (err) {
+        logger.error({ taskId: task.id, err }, 'Failed to cleanup once-task workspace');
+      }
+    }, 60_000);
+  }
 }
 
 async function runScriptTask(
-  task: ScheduledTask,
+  staleTask: ScheduledTask,
   deps: SchedulerDependencies,
   groupJid: string,
   manualRun = false,
 ): Promise<void> {
-  if (!manualRun && !isTaskStillActive(task.id, 'script task')) return;
+  if (!manualRun && !isTaskStillActive(staleTask.id, 'script task')) return;
+
+  // Refresh task from DB to avoid stale closure data
+  const task = getTaskById(staleTask.id);
+  if (!task) return;
 
   runningTaskIds.add(task.id);
   const startTime = Date.now();
@@ -525,7 +552,7 @@ async function runScriptTask(
             error: `计费限制: ${reason}`,
           });
           runningTaskIds.delete(task.id);
-          const nextRun = computeNextRun(task);
+          const nextRun = manualRun ? task.next_run : computeNextRun(task);
           updateTaskAfterRun(task.id, nextRun, `Error: 计费限制: ${reason}`);
           return;
         }
@@ -634,6 +661,33 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
     logger.error({ err }, 'Failed to cleanup stale running task logs');
   }
 
+  // Clean up orphaned workspaces from completed once-tasks
+  // (covers the case where process restarted before setTimeout cleanup fired)
+  try {
+    const allTasks = getAllTasks();
+    const groups = deps.registeredGroups();
+    let cleaned = 0;
+    for (const t of allTasks) {
+      if (
+        t.schedule_type === 'once' &&
+        t.status === 'completed' &&
+        t.workspace_jid &&
+        t.workspace_folder &&
+        groups[t.workspace_jid]
+      ) {
+        deleteGroupData(t.workspace_jid, t.workspace_folder);
+        delete groups[t.workspace_jid];
+        removeFlowArtifacts(t.workspace_folder);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      logger.info({ cleaned }, 'Cleaned up orphaned once-task workspaces from previous session');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to cleanup orphaned once-task workspaces');
+  }
+
   logger.info('Scheduler loop started');
 
   const loop = async () => {
@@ -738,6 +792,8 @@ export function triggerTaskNow(
   if (!task) return { success: false, error: 'Task not found' };
   if (task.status === 'completed')
     return { success: false, error: 'Task already completed' };
+  if (task.status === 'paused')
+    return { success: false, error: '任务已暂停，请先恢复后再运行' };
   if (runningTaskIds.has(taskId))
     return { success: false, error: 'Task is already running' };
 
