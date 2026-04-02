@@ -6,7 +6,9 @@ module.exports = {
       cwd: __dirname,
       env: {
         NODE_ENV: 'production',
-        DOCKER_HOST: `unix://${process.env.HOME}/.colima/default/docker.sock`,
+        ...(process.env.DOCKER_HOST
+          ? { DOCKER_HOST: process.env.DOCKER_HOST }
+          : { DOCKER_HOST: `unix://${process.env.HOME}/.colima/default/docker.sock` }),
       },
       // 自恢复配置
       autorestart: true,

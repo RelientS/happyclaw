@@ -67,6 +67,7 @@ export function UsageBars({ providerId }: { providerId: string }) {
     let cancelled = false;
 
     const fetchUsage = async () => {
+      if (document.visibilityState !== 'visible') return;
       try {
         const data = await api.get<CachedOAuthUsage>(
           `/api/config/claude/providers/${providerId}/usage`,
@@ -82,8 +83,14 @@ export function UsageBars({ providerId }: { providerId: string }) {
     fetchUsage();
     timerRef.current = setInterval(fetchUsage, POLL_INTERVAL_MS);
 
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') fetchUsage();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
     return () => {
       cancelled = true;
+      document.removeEventListener('visibilitychange', onVisible);
       if (timerRef.current) clearInterval(timerRef.current);
     };
   }, [providerId]);
@@ -99,7 +106,7 @@ export function UsageBars({ providerId }: { providerId: string }) {
   if (buckets.length === 0) return null;
 
   return (
-    <div className="mt-1.5 ml-4 flex items-center divide-x divide-border">
+    <div className="mt-1.5 ml-4 flex items-center gap-3">
       {buckets.map((b) => (
         <UsageColumn key={b.label} label={b.label} bucket={b.bucket} />
       ))}

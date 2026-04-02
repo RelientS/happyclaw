@@ -21,7 +21,7 @@ endif
 
 # ─── PM2 Helper ──────────────────────────────────────────────
 
-PM2 := $(shell command -v pm2 2>/dev/null || echo "$(HOME)/.nvm/versions/node/v22.22.0/bin/pm2")
+PM2 := $(shell command -v pm2 2>/dev/null || echo "npx pm2")
 
 _stop-pm2: ## (内部) 停止 PM2 管理的 happyclaw，避免端口冲突
 	@if $(PM2) list 2>/dev/null | grep -q happyclaw; then \

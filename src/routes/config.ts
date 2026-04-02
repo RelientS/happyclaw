@@ -73,7 +73,7 @@ import {
   saveUserDingTalkConfig,
   updateAllSessionCredentials,
 } from '../runtime-config.js';
-import type { ClaudeOAuthCredentials, CachedOAuthUsage, OAuthUsageResponse } from '../runtime-config.js';
+import type { ClaudeOAuthCredentials, CachedOAuthUsage, OAuthUsageResponse, OAuthUsageBucket } from '../runtime-config.js';
 import type { AuthUser, RegisteredGroup } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import { logger } from '../logger.js';
@@ -251,11 +251,17 @@ async function fetchOAuthUsage(providerId: string): Promise<CachedOAuthUsage> {
       }
 
       const raw = (await resp.json()) as Record<string, unknown>;
+      const parseBucket = (v: unknown): OAuthUsageBucket | null => {
+        if (!v || typeof v !== 'object') return null;
+        const obj = v as Record<string, unknown>;
+        if (typeof obj.utilization !== 'number' || typeof obj.resets_at !== 'string') return null;
+        return { utilization: obj.utilization, resets_at: obj.resets_at };
+      };
       const data: OAuthUsageResponse = {
-        five_hour: raw.five_hour as OAuthUsageResponse['five_hour'],
-        seven_day: raw.seven_day as OAuthUsageResponse['seven_day'],
-        seven_day_opus: raw.seven_day_opus as OAuthUsageResponse['seven_day_opus'],
-        seven_day_sonnet: raw.seven_day_sonnet as OAuthUsageResponse['seven_day_sonnet'],
+        five_hour: parseBucket(raw.five_hour),
+        seven_day: parseBucket(raw.seven_day),
+        seven_day_opus: parseBucket(raw.seven_day_opus),
+        seven_day_sonnet: parseBucket(raw.seven_day_sonnet),
       };
 
       const result: CachedOAuthUsage = { data, fetchedAt: Date.now() };
