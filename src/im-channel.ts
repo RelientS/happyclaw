@@ -30,6 +30,7 @@ import {
   type DingTalkConnectionConfig,
 } from './dingtalk.js';
 import { logger } from './logger.js';
+import type { FeishuMessageMeta } from './types.js';
 import {
   StreamingCardController,
   type StreamingCardOptions,
@@ -56,6 +57,7 @@ export interface IMChannelConnectOpts {
   /** 将 IM chatJid 解析为绑定目标 JID（conversation agent 或工作区主对话） */
   resolveEffectiveChatJid?: (
     chatJid: string,
+    messageMeta?: FeishuMessageMeta,
   ) => { effectiveJid: string; agentId: string | null } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
@@ -105,6 +107,7 @@ export interface IMChannel {
     user_count?: string;
     chat_type?: string;
     chat_mode?: string;
+    group_message_type?: string;
   } | null>;
 }
 
@@ -437,6 +440,23 @@ export function createQQChannel(config: QQConnectionConfig): IMChannel {
         return;
       }
       await inner.sendMessage(chatId, text);
+    },
+
+    async sendImage(
+      chatId: string,
+      imageBuffer: Buffer,
+      mimeType: string,
+      caption?: string,
+      fileName?: string,
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'QQ channel not connected, skip sending image',
+        );
+        return;
+      }
+      await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
     },
 
     async setTyping(_chatId: string, _isTyping: boolean): Promise<void> {
