@@ -86,7 +86,11 @@ import {
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
-import { getChannelType, extractChatId } from './im-channel.js';
+import {
+  getChannelType,
+  extractChatId,
+  type StreamingSession,
+} from './im-channel.js';
 import {
   registerStreamingSession,
   unregisterStreamingSession,
@@ -189,7 +193,7 @@ const OOM_EXIT_RE = /code 137/;
  * Centralizes the event → card mapping for both main and sub-agent handlers.
  */
 export function feedStreamEventToCard(
-  session: StreamingCardController,
+  session: StreamingSession,
   se: StreamEvent,
   accumulatedText: string,
 ): void {
@@ -2304,13 +2308,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingSessionJid = replySourceImJid ?? chatJid;
   const makeOnCardCreated = (jid: string) => (messageId: string) =>
     registerMessageIdMapping(messageId, jid);
-  let streamingSession = imManager.createStreamingSession(
+  let streamingSession = await imManager.createStreamingSession(
     streamingSessionJid,
     makeOnCardCreated(streamingSessionJid),
   );
   let streamingAccumulatedText = '';
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
+  logger.info(
+    { chatJid, streamingSessionJid, hasSession: !!streamingSession },
+    'Streaming session creation result',
+  );
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
     logger.debug({ chatJid }, 'Streaming card session created for Feishu');
@@ -2320,7 +2328,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Allows IPC-injected messages (from web.ts / IM polling) to update the
   // reply routing target without killing the agent process.  This replaces
   // the old "closeStdin + restart" approach for home groups (#99).
-  activeRouteUpdaters.set(effectiveGroup.folder, (newSourceJid) => {
+  activeRouteUpdaters.set(effectiveGroup.folder, async (newSourceJid) => {
     const newImJid =
       newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
     // New IPC user message arrived — reset sentReply so the next result
@@ -2349,7 +2357,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         unregisterStreamingSession(streamingSessionJid);
       }
       streamingSessionJid = newStreamingJid;
-      streamingSession = imManager.createStreamingSession(
+      streamingSession = await imManager.createStreamingSession(
         streamingSessionJid,
         makeOnCardCreated(streamingSessionJid),
       );
@@ -2461,7 +2469,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // spamming the IM channel. The first substantive reply already
               // delivered the main content; follow-up results are DB-only.
               streamInterrupted = false;
-              streamingSession = imManager.createStreamingSession(
+              streamingSession = await imManager.createStreamingSession(
                 streamingSessionJid,
                 makeOnCardCreated(streamingSessionJid),
               );
@@ -2827,18 +2835,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 }
               }
 
-              // ── Rebuild streaming card after compact_partial / overflow_partial ──
-              // The completed card was consumed; create a new one so post-compaction
-              // tool-call progress remains visible on Feishu (#223).
-              if (
-                streamingCardHandledIM &&
-                (result.sourceKind === 'compact_partial' ||
-                  result.sourceKind === 'overflow_partial')
-              ) {
+              // ── Rebuild streaming card after completion ──
+              // The completed card was consumed; create a new one so subsequent
+              // messages get a fresh streaming card instead of falling back to static.
+              // Previously only rebuilt for partial outputs (#223); now rebuild for
+              // all completions to fix DingTalk "second message gets no reply" bug.
+              if (streamingCardHandledIM) {
                 unregisterStreamingSession(streamingSessionJid);
                 streamingAccumulatedText = '';
                 streamingAccumulatedThinking = '';
-                streamingSession = imManager.createStreamingSession(
+                streamingSession = await imManager.createStreamingSession(
                   streamingSessionJid,
                   makeOnCardCreated(streamingSessionJid),
                 );
@@ -3433,7 +3439,11 @@ async function runAgent(
   try {
     const executionMode = group.executionMode || 'container';
 
-    const onProcessCb = (proc: ChildProcess, identifier: string, selectedProviderId: string | null) => {
+    const onProcessCb = (
+      proc: ChildProcess,
+      identifier: string,
+      selectedProviderId: string | null,
+    ) => {
       // 宿主机模式：containerName 传 null，走 process.kill() 路径
       const containerName = executionMode === 'container' ? identifier : null;
       queue.registerProcess(chatJid, proc, {
@@ -3858,8 +3868,7 @@ function broadcastToOwnerIMChannels(
     if (sentChannelTypes.has(channelType)) continue;
     if (notifyChannels && !notifyChannels.includes(channelType)) continue;
     const target = ownerGroups.find(
-      (g) =>
-        getChannelType(g.jid) === channelType && g.folder === sourceFolder,
+      (g) => getChannelType(g.jid) === channelType && g.folder === sourceFolder,
     );
     if (target) {
       sendFn(target.jid);
@@ -4019,7 +4028,11 @@ function startIpcWatcher(): void {
                         taskChatJid !== data.chatJid &&
                         taskChatJid !== ipcImRoute
                       ) {
-                        sendImWithFailTracking(taskChatJid, data.text, taskLocalImages);
+                        sendImWithFailTracking(
+                          taskChatJid,
+                          data.text,
+                          taskLocalImages,
+                        );
                       }
                     } else {
                       // Fallback: broadcast to all connected IM channels
@@ -4031,7 +4044,11 @@ function startIpcWatcher(): void {
                         ownerHomeFolderForIm,
                         alreadySent,
                         (jid) =>
-                          sendImWithFailTracking(jid, data.text, taskLocalImages),
+                          sendImWithFailTracking(
+                            jid,
+                            data.text,
+                            taskLocalImages,
+                          ),
                         taskNotifyChannels,
                       );
                     }
@@ -5090,7 +5107,7 @@ async function processAgentConversation(
     ? `${replySourceImJid}#agent:${agentId}`
     : undefined;
   let agentStreamingSession = replySourceImJid
-    ? imManager.createStreamingSession(replySourceImJid, (messageId) =>
+    ? await imManager.createStreamingSession(replySourceImJid, (messageId) =>
         registerMessageIdMapping(messageId, streamingSessionJid!),
       )
     : undefined;
@@ -5372,7 +5389,7 @@ async function processAgentConversation(
         ) {
           agentStreamingAccText = '';
           unregisterStreamingSession(streamingSessionJid);
-          agentStreamingSession = imManager.createStreamingSession(
+          agentStreamingSession = await imManager.createStreamingSession(
             replySourceImJid!,
             (messageId) =>
               registerMessageIdMapping(messageId, streamingSessionJid!),
@@ -5466,7 +5483,11 @@ async function processAgentConversation(
   ipcWatcherManager?.watchGroup(effectiveGroup.folder);
   try {
     const executionMode = effectiveGroup.executionMode || 'container';
-    const onProcessCb = (proc: ChildProcess, identifier: string, selectedProviderId: string | null) => {
+    const onProcessCb = (
+      proc: ChildProcess,
+      identifier: string,
+      selectedProviderId: string | null,
+    ) => {
       const containerName = executionMode === 'container' ? identifier : null;
       queue.registerProcess(virtualJid, proc, {
         containerName,
@@ -5710,7 +5731,10 @@ async function processAgentConversation(
             partialReply,
             effectiveGroup.folder,
           );
-          logger.info({ replySourceImJid, textLen: partialReply.length }, 'agent partial reply ready');
+          logger.info(
+            { replySourceImJid, textLen: partialReply.length },
+            'agent partial reply ready',
+          );
           const imSent = await sendImWithRetry(
             replySourceImJid,
             partialReply,
@@ -6450,7 +6474,10 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
           { homeChatJid, agentId },
           'Agent IM restart: starting processAgentConversation',
         );
-        logger.info({ homeChatJid, agentId, taskId }, 'sub-agent task IPC received');
+        logger.info(
+          { homeChatJid, agentId, taskId },
+          'sub-agent task IPC received',
+        );
         try {
           await processAgentConversation(homeChatJid, agentId);
         } catch (err) {
@@ -7555,10 +7582,7 @@ async function main(): Promise<void> {
       if (options.ownerId) {
         const ownerHome = getUserHomeGroup(options.ownerId);
         if (ownerHome?.folder) {
-          const localImages = extractLocalImImagePaths(
-            text,
-            ownerHome.folder,
-          );
+          const localImages = extractLocalImImagePaths(text, ownerHome.folder);
           broadcastToOwnerIMChannels(
             options.ownerId,
             ownerHome.folder,
