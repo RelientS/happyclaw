@@ -38,6 +38,8 @@ const MIME_MAP: Record<string, string> = {
   gif: 'image/gif',
   svg: 'image/svg+xml',
   webp: 'image/webp',
+  bmp: 'image/bmp',
+  ico: 'image/x-icon',
   // 文本和代码
   txt: 'text/plain',
   md: 'text/markdown',
@@ -66,6 +68,19 @@ const MIME_MAP: Record<string, string> = {
   csv: 'text/csv',
   // PDF
   pdf: 'application/pdf',
+  // 视频
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  avi: 'video/x-msvideo',
+  mkv: 'video/x-matroska',
+  // 音频
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  aac: 'audio/aac',
+  m4a: 'audio/mp4',
+  flac: 'audio/flac',
   // 压缩文件
   zip: 'application/zip',
   tar: 'application/x-tar',
@@ -105,10 +120,12 @@ const TEXT_EXTENSIONS = new Set([
 
 // 允许 inline 预览的安全 MIME 类型（排除 HTML 和 SVG 以防止 XSS）
 const SAFE_PREVIEW_MIME_TYPES = new Set([
+  // 图片
   'image/png',
   'image/jpeg',
   'image/gif',
   'image/webp',
+  // 文本
   'text/plain',
   'text/markdown',
   'text/css',
@@ -126,7 +143,21 @@ const SAFE_PREVIEW_MIME_TYPES = new Set([
   'text/typescript',
   'application/json',
   'application/xml',
+  // PDF
   'application/pdf',
+  // 视频
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
+  'video/x-msvideo',
+  'video/x-matroska',
+  // 音频
+  'audio/mpeg',
+  'audio/wav',
+  'audio/ogg',
+  'audio/aac',
+  'audio/mp4',
+  'audio/flac',
 ]);
 
 /**
